@@ -1,0 +1,1411 @@
+/* =========================================================
+   Application Budget : enveloppes + cagnotte des repas
+   Tout est stocké dans le téléphone (IndexedDB).
+   Aucune donnée n'est envoyée sur internet.
+   ========================================================= */
+'use strict';
+
+/* ---------------------------------------------------------
+   1. Constantes
+   --------------------------------------------------------- */
+
+// Version du format des données. À augmenter seulement si on change
+// la forme des données (pour pouvoir relire les anciennes sauvegardes).
+const VERSION_SCHEMA = 1;
+
+const BASE_NOM = 'budget-app';
+const BASE_VERSION = 1;
+
+// Couleurs proposées pour les enveloppes (lisibles en clair et en sombre)
+const PALETTE = ['#2A9D8F', '#3D6FB6', '#D19A1F', '#7A5BB5', '#E07A5F', '#5C9A3B', '#5E6B7A', '#C4508C'];
+
+// Rappel de sauvegarde au-delà de ce nombre de jours
+const JOURS_RAPPEL_SAUVEGARDE = 30;
+
+// Types de dépenses dans l'enveloppe des repas
+const GENRES_REPAS = {
+  repas: 'Repas acheté',
+  maison: 'Fait maison',
+  offert: 'Offert ou sauté',
+  courses: 'Courses'
+};
+
+/* ---------------------------------------------------------
+   2. Petits outils
+   --------------------------------------------------------- */
+
+const $ = (sel, parent = document) => parent.querySelector(sel);
+const $$ = (sel, parent = document) => Array.from(parent.querySelectorAll(sel));
+
+// Les montants sont stockés en centimes (nombres entiers) pour éviter
+// les erreurs d'arrondi : 6,59 € est stocké 659.
+const formatEuro = new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR' });
+const euros = (centimes) => formatEuro.format((centimes || 0) / 100);
+const eurosSigne = (c) => (c > 0 ? '+' : '') + euros(c);
+
+// Transforme un texte tapé ("6,59", "12", "3.5") en centimes. Renvoie NaN si invalide.
+function lireMontant(texte) {
+  if (texte == null) return NaN;
+  const t = String(texte).replace(/[\s\u00A0\u202F€]/g, '').replace(',', '.');
+  if (t === '' || !/^\d*\.?\d*$/.test(t) || t === '.') return NaN;
+  return Math.round(parseFloat(t) * 100);
+}
+// Centimes → texte modifiable ("6,59")
+const montantEnTexte = (c) => (c / 100).toFixed(2).replace('.', ',');
+
+// Protège les textes saisis avant de les afficher
+function esc(texte) {
+  return String(texte ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+const deux = (n) => String(n).padStart(2, '0');
+const dateIso = (d) => `${d.getFullYear()}-${deux(d.getMonth() + 1)}-${deux(d.getDate())}`;
+const aujourdhui = () => dateIso(new Date());
+const cleMois = (d = new Date()) => dateIso(d).slice(0, 7); // "2026-10"
+
+function decalerMois(cle, n) {
+  const [a, m] = cle.split('-').map(Number);
+  return cleMois(new Date(a, m - 1 + n, 1));
+}
+function joursDuMois(cle) {
+  const [a, m] = cle.split('-').map(Number);
+  return new Date(a, m, 0).getDate();
+}
+function nomMois(cle, court = false) {
+  const [a, m] = cle.split('-').map(Number);
+  return new Date(a, m - 1, 1).toLocaleDateString('fr-FR', court ? { month: 'short' } : { month: 'long', year: 'numeric' });
+}
+function nomJour(iso) {
+  const [a, m, j] = iso.split('-').map(Number);
+  const d = new Date(a, m - 1, j);
+  if (iso === aujourdhui()) return "Aujourd'hui";
+  const hier = new Date(); hier.setDate(hier.getDate() - 1);
+  if (iso === dateIso(hier)) return 'Hier';
+  const t = d.toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' });
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+const majuscule = (t) => t.charAt(0).toUpperCase() + t.slice(1);
+
+function nouvelId() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+}
+const copie = (obj) => JSON.parse(JSON.stringify(obj));
+
+/* ---------------------------------------------------------
+   3. Stockage dans le téléphone (IndexedDB)
+   IndexedDB = une petite base de données intégrée au navigateur.
+   --------------------------------------------------------- */
+
+let base = null;
+
+function ouvrirBase() {
+  return new Promise((ok, echec) => {
+    if (!('indexedDB' in window)) return echec(new Error('stockage-absent'));
+    let demande;
+    try { demande = indexedDB.open(BASE_NOM, BASE_VERSION); } catch (e) { return echec(e); }
+    demande.onupgradeneeded = () => {
+      const b = demande.result;
+      if (!b.objectStoreNames.contains('reglages')) b.createObjectStore('reglages', { keyPath: 'cle' });
+      if (!b.objectStoreNames.contains('depenses')) b.createObjectStore('depenses', { keyPath: 'id' });
+      if (!b.objectStoreNames.contains('mois')) b.createObjectStore('mois', { keyPath: 'mois' });
+      if (!b.objectStoreNames.contains('bilans')) b.createObjectStore('bilans', { keyPath: 'mois' });
+    };
+    demande.onsuccess = () => ok(demande.result);
+    demande.onerror = () => echec(demande.error);
+    demande.onblocked = () => echec(new Error('base-bloquee'));
+  });
+}
+
+// Lance une opération d'écriture/lecture et attend qu'elle soit terminée
+function transaction(magasins, mode, travail) {
+  return new Promise((ok, echec) => {
+    let t;
+    try { t = base.transaction(magasins, mode); } catch (e) { return echec(e); }
+    let resultat;
+    t.oncomplete = () => ok(resultat);
+    t.onerror = () => echec(t.error);
+    t.onabort = () => echec(t.error || new Error('transaction-annulee'));
+    try { resultat = travail(t); } catch (e) { t.abort(); echec(e); }
+  });
+}
+
+function lireTout(magasin) {
+  return new Promise((ok, echec) => {
+    const r = base.transaction(magasin, 'readonly').objectStore(magasin).getAll();
+    r.onsuccess = () => ok(r.result || []);
+    r.onerror = () => echec(r.error);
+  });
+}
+
+// Message clair si l'enregistrement échoue
+function erreurStockage(e) {
+  console.error(e);
+  const nom = e && e.name;
+  if (nom === 'QuotaExceededError') {
+    alerteMessage('Stockage plein', "Le téléphone n'a plus assez de place pour enregistrer. Libère de l'espace (photos, applis), puis fais une sauvegarde depuis Réglages.");
+  } else {
+    alerteMessage("Enregistrement impossible", "La dernière modification n'a pas pu être enregistrée dans le téléphone. Ferme puis rouvre l'appli. Si le problème continue, fais une sauvegarde depuis Réglages.");
+  }
+}
+
+// Raccourcis d'enregistrement : ne bloquent jamais l'interface
+function sauver(magasin, objet) {
+  return transaction([magasin], 'readwrite', (t) => t.objectStore(magasin).put(objet)).catch(erreurStockage);
+}
+function effacer(magasin, cle) {
+  return transaction([magasin], 'readwrite', (t) => t.objectStore(magasin).delete(cle)).catch(erreurStockage);
+}
+
+/* ---------------------------------------------------------
+   4. Données de l'application (en mémoire + copie dans IndexedDB)
+   --------------------------------------------------------- */
+
+const etat = {
+  reglages: null, // enveloppes, conservation, date de dernière sauvegarde...
+  mois: {},       // un enregistrement par mois : enveloppes du mois + charges fixes payées
+  depenses: [],   // toutes les dépenses détaillées
+  bilans: []      // résumés des vieux mois (une ligne par mois)
+};
+let persistanceAccordee = null;
+
+function reglagesParDefaut() {
+  return {
+    cle: 'principal',
+    creeLe: new Date().toISOString(),
+    derniereSauvegarde: null,
+    conservationMois: 12,
+    enveloppes: [
+      { id: nouvelId(), nom: 'Nourriture', type: 'repas', couleur: '#2A9D8F', prixRepas: 659, repasParJour: 2, jours: 31 },
+      { id: nouvelId(), nom: 'Loisirs', type: 'variable', couleur: '#7A5BB5', montant: 30 * 659, cagnotte: true },
+      { id: nouvelId(), nom: 'Essence', type: 'variable', couleur: '#D19A1F', montant: 0, cagnotte: false },
+      { id: nouvelId(), nom: 'Loyer', type: 'fixe', couleur: '#5E6B7A', montant: 0 },
+      { id: nouvelId(), nom: 'Location voiture', type: 'fixe', couleur: '#3D6FB6', montant: 0 }
+    ]
+  };
+}
+
+async function chargerEtat() {
+  const [reglages, mois, depenses, bilans] = await Promise.all(['reglages', 'mois', 'depenses', 'bilans'].map(lireTout));
+  etat.reglages = reglages.find((r) => r.cle === 'principal') || null;
+  if (!etat.reglages) {
+    etat.reglages = reglagesParDefaut();
+    await sauver('reglages', etat.reglages);
+  }
+  etat.mois = {};
+  mois.forEach((m) => { etat.mois[m.mois] = m; });
+  etat.depenses = depenses;
+  etat.bilans = bilans.sort((a, b) => a.mois.localeCompare(b.mois));
+}
+
+// Crée la fiche d'un mois (copie des enveloppes actuelles) si elle n'existe pas
+function assurerMois(cle) {
+  if (!etat.mois[cle]) {
+    etat.mois[cle] = { mois: cle, enveloppes: copie(etat.reglages.enveloppes), fixesPayes: {} };
+    sauver('mois', etat.mois[cle]);
+  }
+  return etat.mois[cle];
+}
+
+// Les réglages s'appliquent au mois en cours ; les mois passés gardent leur version
+function appliquerEnveloppes(liste) {
+  etat.reglages.enveloppes = liste;
+  sauver('reglages', etat.reglages);
+  const m = assurerMois(cleMois());
+  m.enveloppes = copie(liste);
+  sauver('mois', m);
+}
+
+const depensesDuMois = (cle) => etat.depenses.filter((d) => d.mois === cle);
+const enveloppeRepas = (liste) => liste.find((e) => e.type === 'repas');
+
+/* ---------------------------------------------------------
+   5. Calculs du mois (le cœur du système d'enveloppes)
+   --------------------------------------------------------- */
+
+const montantEnveloppe = (e) => (e.type === 'repas' ? e.prixRepas * e.repasParJour * e.jours : (e.montant || 0));
+const compteCommeRepas = (d) => d.genre === 'repas' || d.genre === 'maison' || d.genre === 'offert';
+
+/*
+  Règles de la cagnotte des repas :
+  - chaque repas pris (acheté, fait maison, offert ou sauté) « vaut » le prix d'un repas (6,59 €)
+  - cagnotte = repas pris × prix d'un repas − dépenses de nourriture (repas + courses)
+  - si une enveloppe autorisée (ex. Loisirs) dépasse, le dépassement est pris sur la cagnotte
+  - si la cagnotte devient négative, ça réduit le budget des repas restants
+*/
+function calculerMois(cle, depenses = depensesDuMois(cle)) {
+  const fiche = etat.mois[cle] || { enveloppes: etat.reglages.enveloppes, fixesPayes: {} };
+  const parEnv = {};
+  fiche.enveloppes.forEach((e) => { parEnv[e.id] = { env: e, budget: montantEnveloppe(e), depense: 0 }; });
+
+  let horsEnveloppe = 0; // dépenses d'une enveloppe supprimée depuis
+  depenses.forEach((d) => {
+    if (parEnv[d.envId]) parEnv[d.envId].depense += d.montant;
+    else horsEnveloppe += d.montant;
+  });
+
+  let totalBudget = 0;
+  let totalConsomme = horsEnveloppe;
+  let surCagnotte = 0;
+
+  fiche.enveloppes.forEach((e) => {
+    const p = parEnv[e.id];
+    totalBudget += p.budget;
+    if (e.type === 'fixe') {
+      p.paye = !!fiche.fixesPayes[e.id];
+      p.consomme = (p.paye ? p.budget : 0) + p.depense;
+      p.reste = p.budget - p.consomme;
+    } else if (e.type === 'variable') {
+      p.consomme = p.depense;
+      p.reste = p.budget - p.depense;
+      p.depassement = Math.max(0, -p.reste);
+      p.prisSurCagnotte = e.cagnotte ? p.depassement : 0;
+      surCagnotte += p.prisSurCagnotte;
+    } else {
+      p.consomme = p.depense;
+    }
+    totalConsomme += p.consomme;
+  });
+
+  const eRepas = enveloppeRepas(fiche.enveloppes);
+  let repas = null;
+  if (eRepas) {
+    const p = parEnv[eRepas.id];
+    const deps = depenses.filter((d) => d.envId === eRepas.id);
+    p.repasPris = deps.filter(compteCommeRepas).length;
+    p.repasTotal = eRepas.repasParJour * eRepas.jours;
+    p.repasRestants = p.repasTotal - p.repasPris;
+    p.cagnotte = p.repasPris * eRepas.prixRepas - p.depense - surCagnotte;
+    p.reste = p.budget - p.depense - surCagnotte;
+    p.parRepas = p.repasRestants > 0 ? Math.floor(p.reste / p.repasRestants) : null;
+    repas = p;
+  }
+
+  return { parEnv, repas, totalBudget, totalConsomme, resteGlobal: totalBudget - totalConsomme };
+}
+
+// Avancement du mois en cours (0 à 1), pour repérer un rythme trop rapide
+function avancementMois(cle) {
+  if (cle !== cleMois()) return 1;
+  return new Date().getDate() / joursDuMois(cle);
+}
+
+/* ---------------------------------------------------------
+   6. Navigation, panneau, confirmation, messages
+   --------------------------------------------------------- */
+
+let vueActive = 'budget';
+
+function changerVue(nom) {
+  vueActive = nom;
+  $$('.onglet').forEach((b) => b.classList.toggle('actif', b.dataset.vue === nom));
+  $$('.vue').forEach((v) => { v.hidden = v.id !== 'vue-' + nom; });
+  rendreVue();
+  window.scrollTo(0, 0);
+}
+
+function ouvrirPanneau(html) {
+  const p = $('#panneau');
+  const dejaOuvert = !p.hidden;
+  const defilement = p.scrollTop;
+  p.innerHTML = '<div class="poignee"></div>' + html;
+  p.hidden = false;
+  $('#voile').hidden = false;
+  document.body.style.overflow = 'hidden';
+  p.scrollTop = dejaOuvert ? defilement : 0; // garde la position quand on redessine
+  const fermer = $('.fermer', p);
+  if (fermer) fermer.addEventListener('click', fermerPanneau);
+  return p;
+}
+function fermerPanneau() {
+  $('#panneau').hidden = true;
+  $('#panneau').innerHTML = '';
+  $('#voile').hidden = true;
+  document.body.style.overflow = '';
+}
+const enteteePanneau = (titre) => `
+  <div class="panneau-titre"><h2>${esc(titre)}</h2>
+  <button class="fermer" aria-label="Fermer"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>`;
+
+// Fenêtre de confirmation. Renvoie une promesse : true si l'utilisateur confirme.
+function confirmer({ titre, texte = '', oui = 'Confirmer', non = 'Annuler', danger = false }) {
+  return new Promise((reponse) => {
+    const fond = $('#confirm');
+    $('#confirm-titre').textContent = titre;
+    $('#confirm-texte').textContent = texte;
+    const bOui = $('#confirm-oui');
+    const bNon = $('#confirm-non');
+    bOui.textContent = oui;
+    bNon.textContent = non;
+    bNon.hidden = non === null;
+    bOui.classList.toggle('danger', danger);
+    fond.hidden = false;
+    const fin = (valeur) => {
+      fond.hidden = true;
+      bOui.onclick = null; bNon.onclick = null;
+      reponse(valeur);
+    };
+    bOui.onclick = () => fin(true);
+    bNon.onclick = () => fin(false);
+  });
+}
+const alerteMessage = (titre, texte) => confirmer({ titre, texte, oui: 'OK', non: null });
+
+let minuteurToast = null;
+function toast(texte) {
+  const t = $('#toast');
+  t.textContent = texte;
+  t.hidden = false;
+  clearTimeout(minuteurToast);
+  minuteurToast = setTimeout(() => { t.hidden = true; }, 2600);
+}
+
+/* ---------------------------------------------------------
+   7. Bandeau du haut : reste global (toujours visible)
+   --------------------------------------------------------- */
+
+function rendreGlobal() {
+  const cle = cleMois();
+  const c = calculerMois(cle);
+  $('#global-mois').textContent = 'Reste en ' + nomMois(cle).split(' ')[0];
+  $('#global-sur').textContent = 'sur ' + euros(c.totalBudget);
+  const r = $('#global-reste');
+  r.textContent = euros(c.resteGlobal);
+  r.classList.toggle('negatif', c.resteGlobal < 0);
+  const ratio = c.totalBudget > 0 ? Math.max(0, Math.min(1, c.resteGlobal / c.totalBudget)) : 0;
+  $('#global-barre').style.width = (ratio * 100).toFixed(1) + '%';
+}
+
+/* ---------------------------------------------------------
+   8. Onglet Budget
+   --------------------------------------------------------- */
+
+function bandeauxInformation() {
+  let html = '';
+  const r = etat.reglages;
+
+  // Montants pas encore renseignés
+  const aZero = r.enveloppes.filter((e) => e.type !== 'repas' && !e.montant).map((e) => e.nom);
+  if (aZero.length) {
+    html += `<div class="bandeau"><p>Indique le montant de : ${esc(aZero.join(', '))}.</p>
+      <div class="bandeau-boutons"><button class="btn btn-petit btn-principal" data-action="aller-reglages">Ouvrir les réglages</button></div></div>`;
+  }
+
+  // Vieux mois à résumer
+  const aArchiver = moisAArchiver();
+  if (aArchiver.length) {
+    const noms = aArchiver.map((c) => nomMois(c)).join(', ');
+    html += `<div class="bandeau"><p>Le détail de ${esc(noms)} a plus de ${r.conservationMois} mois. Il va être résumé en une ligne de bilan pour garder l'appli légère. Fais une sauvegarde avant si tu veux garder le détail.</p>
+      <div class="bandeau-boutons">
+        <button class="btn btn-petit btn-discret" data-action="exporter">Sauvegarder</button>
+        <button class="btn btn-petit btn-principal" data-action="archiver">Résumer</button>
+      </div></div>`;
+  }
+
+  // Rappel de sauvegarde
+  const reference = new Date(r.derniereSauvegarde || r.creeLe);
+  const jours = Math.floor((Date.now() - reference.getTime()) / 86400000);
+  if (jours > JOURS_RAPPEL_SAUVEGARDE) {
+    const texte = r.derniereSauvegarde
+      ? `Ta dernière sauvegarde date de ${jours} jours.`
+      : "Tu n'as encore jamais sauvegardé tes données.";
+    html += `<div class="bandeau"><p>${texte} Une sauvegarde te protège si le téléphone efface les données.</p>
+      <div class="bandeau-boutons"><button class="btn btn-petit btn-principal" data-action="exporter">Sauvegarder maintenant</button></div></div>`;
+  }
+  return html;
+}
+
+function carteRepas(p, cle) {
+  const e = p.env;
+  const remplissage = p.budget > 0 ? Math.max(0, Math.min(1, p.reste / p.budget)) : 0;
+  let detail;
+  if (p.repasRestants > 0) {
+    detail = `${p.repasPris} repas pris sur ${p.repasTotal}. Il te reste <span class="chiffre">${euros(p.parRepas)}</span> par repas.`;
+  } else {
+    detail = `${p.repasPris} repas pris sur ${p.repasTotal}.`;
+  }
+  let alerte = '';
+  if (p.reste < 0) alerte = `<div class="env-alerte rouge">Budget nourriture dépassé de ${euros(-p.reste)}.</div>`;
+  else if (p.parRepas !== null && p.parRepas < e.prixRepas * 0.75) alerte = `<div class="env-alerte">Budget par repas serré : vise des repas faits maison.</div>`;
+
+  const cagnotte = p.cagnotte >= 0
+    ? `<span>Économies</span><span class="cagnotte-montant positif">${eurosSigne(p.cagnotte)}</span>`
+    : `<span>À amortir<small>Se rattrape à chaque repas fait maison</small></span><span class="cagnotte-montant negatif">${euros(-p.cagnotte)}</span>`;
+
+  const rapides = cle === cleMois() ? `
+    <div class="rapides">
+      <button class="rapide" data-rapide="repas">Repas acheté</button>
+      <button class="rapide" data-rapide="maison">Fait maison</button>
+    </div>
+    <div class="rapides">
+      <button class="rapide" data-rapide="courses">Courses</button>
+      <button class="rapide" data-rapide="offert">Offert ou sauté</button>
+    </div>` : '';
+
+  return `
+    <div class="env" style="--c:${e.couleur}">
+      <div class="env-niveau" style="width:${(remplissage * 100).toFixed(1)}%"></div>
+      <div class="env-haut">
+        <div class="env-nom"><span class="pastille"></span><span>${esc(e.nom)}</span></div>
+        <div class="env-reste ${p.reste < 0 ? 'negatif' : ''}">${euros(p.reste)}</div>
+      </div>
+      <div class="env-detail">${detail}</div>
+      ${alerte}
+      <div class="cagnotte">${cagnotte}</div>
+      ${rapides}
+    </div>`;
+}
+
+function carteVariable(p, cle) {
+  const e = p.env;
+  const remplissage = p.budget > 0 ? Math.max(0, Math.min(1, p.reste / p.budget)) : 0;
+  const resteAffiche = p.prisSurCagnotte > 0 ? 0 : p.reste;
+  let detail = `${euros(p.depense)} dépensés sur ${euros(p.budget)}.`;
+  let alerte = '';
+  if (p.prisSurCagnotte > 0) {
+    alerte = `<div class="env-alerte">${euros(p.prisSurCagnotte)} pris sur la cagnotte des repas.</div>`;
+  } else if (p.reste < 0) {
+    alerte = `<div class="env-alerte rouge">Dépassé de ${euros(-p.reste)}.</div>`;
+  } else if (p.budget > 0 && p.depense / p.budget > avancementMois(cle) + 0.15) {
+    alerte = `<div class="env-alerte">Tu dépenses plus vite que le mois n'avance.</div>`;
+  }
+  return `
+    <button class="env" style="--c:${e.couleur}" data-env="${e.id}">
+      <div class="env-niveau" style="width:${(remplissage * 100).toFixed(1)}%"></div>
+      <div class="env-haut">
+        <div class="env-nom"><span class="pastille"></span><span>${esc(e.nom)}</span></div>
+        <div class="env-reste ${resteAffiche < 0 ? 'negatif' : ''}">${euros(resteAffiche)}</div>
+      </div>
+      <div class="env-detail">${detail}</div>
+      ${alerte}
+    </button>`;
+}
+
+function rendreBudget() {
+  const cle = cleMois();
+  const fiche = assurerMois(cle);
+  const c = calculerMois(cle);
+  const vue = $('#vue-budget');
+
+  let html = bandeauxInformation();
+  html += '<div class="enveloppes">';
+  fiche.enveloppes.filter((e) => e.type !== 'fixe').forEach((e) => {
+    const p = c.parEnv[e.id];
+    html += e.type === 'repas' ? carteRepas(p, cle) : carteVariable(p, cle);
+  });
+  html += '</div>';
+
+  const fixes = fiche.enveloppes.filter((e) => e.type === 'fixe');
+  if (fixes.length) {
+    html += '<h3>Charges fixes</h3><div class="fixes">';
+    fixes.forEach((e) => {
+      const paye = !!fiche.fixesPayes[e.id];
+      html += `<button class="fixe ${paye ? 'paye' : ''}" style="--c:${e.couleur}" data-fixe="${e.id}" role="checkbox" aria-checked="${paye}">
+        <span class="coche"><svg viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></svg></span>
+        <span class="fixe-nom">${esc(e.nom)}</span>
+        <span class="fixe-montant">${euros(e.montant)}</span>
+      </button>`;
+    });
+    html += '</div><p class="aide">Coche une charge quand elle est payée : le reste du mois se met à jour.</p>';
+  }
+  vue.innerHTML = html;
+
+  // Actions
+  $$('[data-rapide]', vue).forEach((b) => b.addEventListener('click', () => ouvrirSaisie({ genre: b.dataset.rapide })));
+  $$('[data-env]', vue).forEach((b) => b.addEventListener('click', () => ouvrirSaisie({ envId: b.dataset.env })));
+  $$('[data-fixe]', vue).forEach((b) => b.addEventListener('click', () => basculerFixe(b.dataset.fixe)));
+  brancherActionsCommunes(vue);
+}
+
+function basculerFixe(id) {
+  const fiche = assurerMois(cleMois());
+  if (fiche.fixesPayes[id]) delete fiche.fixesPayes[id];
+  else fiche.fixesPayes[id] = true;
+  sauver('mois', fiche);
+  rendreTout();
+}
+
+// Boutons présents dans plusieurs écrans (bandeaux)
+function brancherActionsCommunes(zone) {
+  $$('[data-action="aller-reglages"]', zone).forEach((b) => b.addEventListener('click', () => changerVue('reglages')));
+  $$('[data-action="exporter"]', zone).forEach((b) => b.addEventListener('click', exporter));
+  $$('[data-action="archiver"]', zone).forEach((b) => b.addEventListener('click', archiver));
+}
+
+/* ---------------------------------------------------------
+   9. Saisie et modification d'une dépense
+   --------------------------------------------------------- */
+
+function momentParDefaut() {
+  return new Date().getHours() < 16 ? 'midi' : 'soir';
+}
+
+// options : { depense } pour modifier, ou { envId, genre } pour une nouvelle
+function ouvrirSaisie(options = {}) {
+  const existante = options.depense || null;
+  const mois = existante ? existante.mois : cleMois();
+  const fiche = assurerMois(mois);
+  const envsSaisie = fiche.enveloppes.filter((e) => e.type !== 'fixe');
+  const eRepas = enveloppeRepas(fiche.enveloppes);
+
+  if (!envsSaisie.length) {
+    alerteMessage('Aucune enveloppe', 'Ajoute une enveloppe variable dans Réglages pour pouvoir saisir des dépenses.');
+    return;
+  }
+
+  // Valeurs du formulaire
+  const f = existante ? {
+    envId: existante.envId,
+    genre: existante.genre,
+    moment: existante.moment || momentParDefaut(),
+    montantTxt: compteCommeRepas(existante) && existante.genre !== 'repas' ? '' : montantEnTexte(existante.montant),
+    note: existante.note || '',
+    date: existante.date
+  } : {
+    envId: options.envId || (options.genre && eRepas ? eRepas.id : (eRepas ? eRepas.id : envsSaisie[0].id)),
+    genre: options.genre || 'repas',
+    moment: momentParDefaut(),
+    montantTxt: '',
+    note: '',
+    date: mois === cleMois() ? aujourdhui() : `${mois}-01`
+  };
+  const estRepasEnv = () => eRepas && f.envId === eRepas.id;
+  if (!existante) {
+    if (!estRepasEnv()) f.genre = 'libre';
+    if (f.genre === 'repas') f.montantTxt = montantEnTexte(eRepas.prixRepas);
+  }
+  const avecMontant = () => !(estRepasEnv() && (f.genre === 'maison' || f.genre === 'offert'));
+  const avecMoment = () => estRepasEnv() && f.genre !== 'courses';
+
+  const derniersJour = `${mois}-${deux(joursDuMois(mois))}`;
+
+  function dessiner() {
+    const envChoix = envsSaisie.map((e) => `<button style="--c:${e.couleur}" data-choix-env="${e.id}" aria-pressed="${e.id === f.envId}"><span class="pastille"></span>${esc(e.nom)}</button>`).join('');
+    const genreChoix = estRepasEnv() ? `
+      <div class="champ"><span class="etiquette">Type</span><div class="choix">
+        ${Object.entries(GENRES_REPAS).map(([g, nom]) => `<button data-choix-genre="${g}" aria-pressed="${g === f.genre}">${nom}</button>`).join('')}
+      </div></div>` : '';
+    const momentChoix = avecMoment() ? `
+      <div class="champ"><div class="segment">
+        <button data-moment="midi" aria-pressed="${f.moment === 'midi'}">Midi</button>
+        <button data-moment="soir" aria-pressed="${f.moment === 'soir'}">Soir</button>
+      </div></div>` : '';
+    const montant = avecMontant() ? `
+      <div class="champ"><label for="saisie-montant">Montant (€)</label>
+        <input id="saisie-montant" class="montant-saisie" inputmode="decimal" autocomplete="off" placeholder="0,00" value="${esc(f.montantTxt)}">
+      </div>` : `<p class="aide">Ce repas compte pour ${euros(eRepas.prixRepas)} dans ta cagnotte, sans dépense.</p>`;
+
+    const p = ouvrirPanneau(`
+      ${enteteePanneau(existante ? 'Modifier la dépense' : 'Nouvelle dépense')}
+      <div class="champ"><span class="etiquette">Enveloppe</span><div class="choix">${envChoix}</div></div>
+      ${genreChoix}
+      ${momentChoix}
+      ${montant}
+      <div class="champ"><label for="saisie-note">Note (facultatif)</label>
+        <input id="saisie-note" type="text" autocomplete="off" placeholder="${estRepasEnv() ? 'Ex. : sandwich, resto U' : 'Ex. : cinéma, plein'}" value="${esc(f.note)}"></div>
+      <div class="champ"><label for="saisie-date">Date</label>
+        <input id="saisie-date" type="date" min="${mois}-01" max="${derniersJour}" value="${f.date}"></div>
+      <div class="apercu" id="apercu"></div>
+      <button class="btn btn-principal btn-large" id="saisie-ok">${existante ? 'Enregistrer les modifications' : 'Ajouter la dépense'}</button>
+      ${existante ? '<div style="height:10px"></div><button class="btn btn-danger btn-large" id="saisie-suppr">Supprimer la dépense</button>' : ''}
+    `);
+
+    $$('[data-choix-env]', p).forEach((b) => b.addEventListener('click', () => {
+      f.envId = b.dataset.choixEnv;
+      if (estRepasEnv()) {
+        f.genre = 'repas';
+        if (!f.montantTxt) f.montantTxt = montantEnTexte(eRepas.prixRepas);
+      } else {
+        f.genre = 'libre';
+      }
+      dessiner();
+    }));
+    $$('[data-choix-genre]', p).forEach((b) => b.addEventListener('click', () => {
+      const ancien = f.genre;
+      f.genre = b.dataset.choixGenre;
+      if (f.genre === 'repas' && !f.montantTxt) f.montantTxt = montantEnTexte(eRepas.prixRepas);
+      if (f.genre === 'courses' && ancien === 'repas' && lireMontant(f.montantTxt) === eRepas.prixRepas) f.montantTxt = '';
+      dessiner();
+      if (f.genre === 'courses' && !f.montantTxt) $('#saisie-montant')?.focus();
+    }));
+    $$('[data-moment]', p).forEach((b) => b.addEventListener('click', () => { f.moment = b.dataset.moment; dessiner(); }));
+
+    const champMontant = $('#saisie-montant', p);
+    if (champMontant) champMontant.addEventListener('input', () => { f.montantTxt = champMontant.value; majApercu(); });
+    $('#saisie-note', p).addEventListener('input', (ev) => { f.note = ev.target.value; });
+    $('#saisie-date', p).addEventListener('change', (ev) => { f.date = ev.target.value; majApercu(); });
+    $('#saisie-ok', p).addEventListener('click', valider);
+    if (existante) $('#saisie-suppr', p).addEventListener('click', supprimerDepense);
+    majApercu();
+  }
+
+  // Construit la dépense à partir du formulaire (ou null si invalide)
+  function construire() {
+    let montant = 0;
+    if (avecMontant()) {
+      montant = lireMontant(f.montantTxt);
+      if (!(montant > 0)) return null;
+    }
+    const date = f.date && f.date.startsWith(mois) ? f.date : (mois === cleMois() ? aujourdhui() : `${mois}-01`);
+    return {
+      id: existante ? existante.id : nouvelId(),
+      envId: f.envId,
+      genre: estRepasEnv() ? f.genre : 'libre',
+      moment: avecMoment() ? f.moment : null,
+      montant,
+      note: f.note.trim(),
+      date,
+      mois,
+      creeLe: existante ? existante.creeLe : new Date().toISOString()
+    };
+  }
+
+  // Calcule l'effet de la dépense et prépare le message d'aperçu
+  function analyser(dep) {
+    const autres = depensesDuMois(mois).filter((d) => !existante || d.id !== existante.id);
+    const avant = calculerMois(mois, autres);
+    const apres = calculerMois(mois, dep ? [...autres, dep] : autres);
+    const pA = apres.parEnv[f.envId];
+    const e = pA.env;
+    let texte = '';
+    let niveau = 'ok';
+
+    if (e.type === 'repas') {
+      const r = apres.repas;
+      texte = r.repasRestants > 0
+        ? `Après : <strong>${euros(r.reste)}</strong> pour ${r.repasRestants} repas restants, soit <strong>${euros(r.parRepas)}</strong> par repas.`
+        : `Après : il reste <strong>${euros(r.reste)}</strong> dans l'enveloppe.`;
+      texte += r.cagnotte >= 0
+        ? ` Économies : <strong>${eurosSigne(r.cagnotte)}</strong>.`
+        : ` À amortir : <strong>${euros(-r.cagnotte)}</strong>.`;
+      if (r.reste < 0 && r.reste < avant.repas.reste) {
+        niveau = 'alerte';
+        texte = `Cette dépense fait dépasser le budget nourriture de <strong>${euros(-r.reste)}</strong>.`;
+      }
+    } else {
+      if (e.cagnotte && pA.prisSurCagnotte > 0) {
+        const r = apres.repas;
+        texte = `Enveloppe vide : <strong>${euros(pA.prisSurCagnotte)}</strong> seront pris sur la cagnotte des repas.`;
+        niveau = 'attention';
+        if (r && r.cagnotte < 0) {
+          texte += ` La cagnotte ne suffit pas : le budget par repas passera à <strong>${euros(r.parRepas || 0)}</strong>.`;
+        }
+        if (!r) { niveau = 'alerte'; texte = `Cette dépense fait dépasser ${esc(e.nom)} de <strong>${euros(pA.depassement)}</strong>.`; }
+      } else if (pA.reste < 0) {
+        niveau = 'alerte';
+        texte = `Cette dépense fait dépasser ${esc(e.nom)} de <strong>${euros(-pA.reste)}</strong>.`;
+      } else {
+        texte = `Après : il restera <strong>${euros(pA.reste)}</strong> dans ${esc(e.nom)}.`;
+      }
+    }
+    if (apres.resteGlobal < 0 && apres.resteGlobal < avant.resteGlobal) {
+      niveau = 'alerte';
+      texte += ` Ton budget du mois passera à <strong>${euros(apres.resteGlobal)}</strong>.`;
+    }
+    // Pas d'alerte si la situation ne s'aggrave pas (ex. on baisse un montant)
+    if (niveau !== 'ok' && apres.resteGlobal >= avant.resteGlobal && pA.consomme <= avant.parEnv[f.envId].consomme) niveau = 'ok';
+    return { texte, niveau };
+  }
+
+  function majApercu() {
+    const zone = $('#apercu');
+    if (!zone) return;
+    const dep = construire();
+    if (avecMontant() && !dep) {
+      zone.className = 'apercu';
+      zone.innerHTML = f.montantTxt ? 'Montant invalide. Exemple : 6,59' : 'Indique le montant.';
+      return;
+    }
+    const { texte, niveau } = analyser(dep);
+    zone.className = 'apercu' + (niveau === 'alerte' ? ' alerte' : niveau === 'attention' ? ' attention' : '');
+    zone.innerHTML = texte;
+  }
+
+  async function valider() {
+    const dep = construire();
+    if (!dep) {
+      $('#saisie-montant')?.focus();
+      toast('Indique un montant valide.');
+      return;
+    }
+    const { niveau } = analyser(dep);
+    if (niveau !== 'ok') {
+      const tmp = document.createElement('div');
+      tmp.innerHTML = analyser(dep).texte;
+      const ok = await confirmer({ titre: 'Attention au budget', texte: tmp.textContent, oui: 'Ajouter quand même' });
+      if (!ok) return;
+    }
+    if (existante) {
+      const i = etat.depenses.findIndex((d) => d.id === dep.id);
+      if (i >= 0) etat.depenses[i] = dep;
+    } else {
+      etat.depenses.push(dep);
+    }
+    sauver('depenses', dep);
+    fermerPanneau();
+    rendreTout();
+    toast(existante ? 'Dépense modifiée.' : 'Dépense ajoutée.');
+  }
+
+  async function supprimerDepense() {
+    const ok = await confirmer({ titre: 'Supprimer cette dépense ?', texte: 'Elle sera retirée de ton budget. Cette action est définitive.', oui: 'Supprimer', danger: true });
+    if (!ok) return;
+    etat.depenses = etat.depenses.filter((d) => d.id !== existante.id);
+    effacer('depenses', existante.id);
+    fermerPanneau();
+    rendreTout();
+    toast('Dépense supprimée.');
+  }
+
+  dessiner();
+}
+
+/* ---------------------------------------------------------
+   10. Onglet Historique
+   --------------------------------------------------------- */
+
+let moisHistorique = null;
+
+function titreDepense(d, env) {
+  if (env && env.type === 'repas') {
+    const genre = GENRES_REPAS[d.genre] || 'Dépense';
+    if (d.genre === 'courses') return d.note ? `Courses, ${d.note}` : 'Courses';
+    const moment = d.moment === 'midi' ? 'Midi' : d.moment === 'soir' ? 'Soir' : '';
+    return [moment, genre.toLowerCase()].filter(Boolean).join(', ') + (d.note ? ` (${d.note})` : '');
+  }
+  return d.note || (env ? env.nom : 'Dépense');
+}
+
+function tuilesResume(c) {
+  const r = c.repas;
+  return `<div class="resume">
+    <div class="tuile"><div class="tuile-etiquette">Dépensé</div><div class="tuile-valeur">${euros(c.totalConsomme)}</div></div>
+    <div class="tuile"><div class="tuile-etiquette">Reste</div><div class="tuile-valeur ${c.resteGlobal < 0 ? 'negatif' : ''}">${euros(c.resteGlobal)}</div></div>
+    ${r ? `<div class="tuile"><div class="tuile-etiquette">Économies repas</div><div class="tuile-valeur ${r.cagnotte >= 0 ? 'positif' : 'negatif'}">${eurosSigne(r.cagnotte)}</div></div>
+    <div class="tuile"><div class="tuile-etiquette">Repas pris</div><div class="tuile-valeur">${r.repasPris} / ${r.repasTotal}</div></div>` : ''}
+  </div>`;
+}
+
+function rendreHistorique() {
+  const vue = $('#vue-historique');
+  const moisDispo = Object.keys(etat.mois).sort().reverse();
+  if (!moisHistorique || !etat.mois[moisHistorique]) moisHistorique = cleMois();
+  const cle = moisHistorique;
+  const fiche = etat.mois[cle];
+  const c = calculerMois(cle);
+  const deps = depensesDuMois(cle).sort((a, b) => (b.date + b.creeLe).localeCompare(a.date + a.creeLe));
+
+  let html = '';
+  if (moisDispo.length > 1) {
+    html += `<div class="champ"><select id="choix-mois" aria-label="Mois">
+      ${moisDispo.map((m) => `<option value="${m}" ${m === cle ? 'selected' : ''}>${majuscule(nomMois(m))}</option>`).join('')}
+    </select></div>`;
+  } else {
+    html += `<h2>${majuscule(nomMois(cle))}</h2>`;
+  }
+  html += tuilesResume(c);
+
+  if (!deps.length) {
+    html += `<div class="vide">Aucune dépense ce mois-ci. Appuie sur + pour ajouter la première.</div>`;
+  } else {
+    let jourCourant = null;
+    html += '<div>';
+    deps.forEach((d) => {
+      if (d.date !== jourCourant) {
+        if (jourCourant) html += '</div>';
+        jourCourant = d.date;
+        html += `<div class="jour">${esc(nomJour(d.date))}</div><div class="liste">`;
+      }
+      const env = fiche.enveloppes.find((e) => e.id === d.envId);
+      const gratuit = compteCommeRepas(d) && d.montant === 0;
+      html += `<button class="ligne" data-dep="${d.id}">
+        <span class="pastille" style="--c:${env ? env.couleur : '#999'}"></span>
+        <span class="ligne-texte"><span class="ligne-titre">${esc(titreDepense(d, env))}</span>
+        <span class="ligne-sous">${esc(env ? env.nom : 'Enveloppe supprimée')}</span></span>
+        <span class="ligne-valeur ${gratuit ? 'zero' : ''}">${gratuit ? '0 €' : euros(d.montant)}</span>
+      </button>`;
+    });
+    html += '</div></div>';
+  }
+
+  if (etat.bilans.length) {
+    html += '<h3>Mois archivés</h3><div class="liste">';
+    [...etat.bilans].reverse().forEach((b) => {
+      html += `<div class="ligne"><span class="ligne-texte"><span class="ligne-titre">${majuscule(nomMois(b.mois))}</span>
+        <span class="ligne-sous">Dépensé ${euros(b.depense)} sur ${euros(b.budget)}</span></span>
+        <span class="ligne-valeur ${b.economies >= 0 ? 'zero' : ''}">${eurosSigne(b.economies)}</span></div>`;
+    });
+    html += '</div><p class="aide">Montant à droite : économies faites sur les repas.</p>';
+  }
+
+  vue.innerHTML = html;
+  $('#choix-mois', vue)?.addEventListener('change', (ev) => { moisHistorique = ev.target.value; rendreHistorique(); });
+  $$('[data-dep]', vue).forEach((b) => b.addEventListener('click', () => {
+    const d = etat.depenses.find((x) => x.id === b.dataset.dep);
+    if (d) ouvrirSaisie({ depense: d });
+  }));
+}
+
+/* ---------------------------------------------------------
+   11. Onglet Statistiques (graphiques dessinés en SVG, sans bibliothèque)
+   --------------------------------------------------------- */
+
+function graphiqueAnneau(parts) {
+  const total = parts.reduce((s, p) => s + p.valeur, 0);
+  if (total <= 0) return '<div class="vide">Pas encore de dépense ce mois-ci.</div>';
+  let cumul = 0;
+  const arcs = parts.map((p) => {
+    const pct = (p.valeur / total) * 100;
+    const arc = `<circle r="15.915" cx="21" cy="21" fill="none" stroke="${p.couleur}" stroke-width="6"
+      stroke-dasharray="${pct.toFixed(3)} ${(100 - pct).toFixed(3)}" stroke-dashoffset="${(25 - cumul).toFixed(3)}"/>`;
+    cumul += pct;
+    return arc;
+  }).join('');
+  const legende = parts.map((p) => `<div><span class="pastille" style="--c:${p.couleur}"></span>${esc(p.nom)}
+    <span class="chiffre">${euros(p.valeur)}</span></div>`).join('');
+  return `<svg viewBox="0 0 42 42" style="max-width:200px;margin:0 auto" role="img" aria-label="Répartition des dépenses">${arcs}
+    <text x="21" y="22.5" text-anchor="middle" font-size="4.2" font-weight="600" style="fill:var(--encre)">${euros(total)}</text></svg>
+    <div class="legende">${legende}</div>`;
+}
+
+function graphiqueBarres(valeurs, etiquettes, { couleur = 'var(--vert)', couleurNeg = 'var(--ambre)', hauteur = 140, etiquetteTous = 1 } = {}) {
+  const largeur = 320;
+  const n = valeurs.length;
+  const max = Math.max(1, ...valeurs.map((v) => Math.abs(v)));
+  const aNegatif = valeurs.some((v) => v < 0);
+  const zone = hauteur - 22;
+  const zero = aNegatif ? zone / 2 : zone;
+  const echelle = aNegatif ? zone / 2 / max : zone / max;
+  const pas = largeur / n;
+  const l = Math.max(2, pas * 0.68);
+  let barres = '';
+  valeurs.forEach((v, i) => {
+    const h = Math.abs(v) * echelle;
+    const x = i * pas + (pas - l) / 2;
+    const y = v >= 0 ? zero - h : zero;
+    if (v !== 0) barres += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${l.toFixed(1)}" height="${Math.max(1, h).toFixed(1)}" rx="${Math.min(3, l / 2).toFixed(1)}" fill="${v >= 0 ? couleur : couleurNeg}"/>`;
+    if (i % etiquetteTous === 0 || i === n - 1) barres += `<text x="${(i * pas + pas / 2).toFixed(1)}" y="${hauteur - 4}" text-anchor="middle" font-size="10">${esc(etiquettes[i])}</text>`;
+  });
+  const axe = `<line x1="0" x2="${largeur}" y1="${zero}" y2="${zero}" stroke="var(--trait)" stroke-width="1"/>`;
+  return `<svg viewBox="0 0 ${largeur} ${hauteur}" role="img">${axe}${barres}</svg>`;
+}
+
+function rendreStats() {
+  const vue = $('#vue-stats');
+  const cle = cleMois();
+  const fiche = assurerMois(cle);
+  const c = calculerMois(cle);
+  const deps = depensesDuMois(cle);
+  let html = `<h2>${majuscule(nomMois(cle))}</h2>`;
+
+  // 1. Où part l'argent
+  const parts = fiche.enveloppes
+    .map((e) => ({ nom: e.nom, couleur: e.couleur, valeur: c.parEnv[e.id].consomme }))
+    .filter((p) => p.valeur > 0)
+    .sort((a, b) => b.valeur - a.valeur);
+  html += `<h3>Où part ton argent</h3><div class="graphique">${graphiqueAnneau(parts)}</div>`;
+
+  // 2. Dépenses jour par jour (hors charges fixes)
+  const nbJours = joursDuMois(cle);
+  const parJour = Array(nbJours).fill(0);
+  deps.forEach((d) => { const j = Number(d.date.slice(8, 10)); if (j >= 1 && j <= nbJours) parJour[j - 1] += d.montant; });
+  const totalJour = parJour.reduce((s, v) => s + v, 0);
+  const jourActuel = new Date().getDate();
+  html += `<h3>Dépenses jour par jour</h3><div class="graphique">
+    ${graphiqueBarres(parJour.map((v) => v / 100), parJour.map((_, i) => String(i + 1)), { etiquetteTous: 5 })}
+    <p class="aide" style="margin:10px 0 0">Moyenne : ${euros(Math.round(totalJour / Math.max(1, jourActuel)))} par jour depuis le début du mois (charges fixes non comprises).</p></div>`;
+
+  // 3. Les repas
+  const eRepas = enveloppeRepas(fiche.enveloppes);
+  if (eRepas && c.repas) {
+    const dRepas = deps.filter((d) => d.envId === eRepas.id);
+    const compte = (g) => dRepas.filter((d) => d.genre === g).length;
+    const moyenne = c.repas.repasPris > 0 ? Math.round(c.repas.depense / c.repas.repasPris) : 0;
+    html += `<h3>Tes repas</h3><div class="resume">
+      <div class="tuile"><div class="tuile-etiquette">Achetés</div><div class="tuile-valeur">${compte('repas')}</div></div>
+      <div class="tuile"><div class="tuile-etiquette">Faits maison</div><div class="tuile-valeur">${compte('maison')}</div></div>
+      <div class="tuile"><div class="tuile-etiquette">Offerts ou sautés</div><div class="tuile-valeur">${compte('offert')}</div></div>
+      <div class="tuile"><div class="tuile-etiquette">Coût moyen</div><div class="tuile-valeur">${euros(moyenne)}</div></div>
+    </div><p class="aide">Coût moyen = dépenses de nourriture (courses comprises) divisées par le nombre de repas pris. Objectif : rester sous ${euros(eRepas.prixRepas)}.</p>`;
+  }
+
+  // 4. Économies mois après mois
+  const serie = [];
+  etat.bilans.forEach((b) => serie.push({ mois: b.mois, valeur: b.economies }));
+  Object.keys(etat.mois).sort().forEach((m) => {
+    const r = calculerMois(m).repas;
+    serie.push({ mois: m, valeur: r ? r.cagnotte : 0 });
+  });
+  const derniers = serie.slice(-12);
+  if (derniers.length > 1) {
+    html += `<h3>Économies mois après mois</h3><div class="graphique">
+      ${graphiqueBarres(derniers.map((s) => s.valeur / 100), derniers.map((s) => nomMois(s.mois, true).replace('.', '')))}
+      <p class="aide" style="margin:10px 0 0">Économies faites sur les repas. Le dernier mois est en cours.</p></div>`;
+  } else {
+    html += `<h3>Économies mois après mois</h3><div class="graphique"><div class="vide">Ce graphique apparaîtra à partir du mois prochain.</div></div>`;
+  }
+  vue.innerHTML = html;
+}
+
+/* ---------------------------------------------------------
+   12. Onglet Réglages
+   --------------------------------------------------------- */
+
+function descriptionEnveloppe(e) {
+  if (e.type === 'repas') return `Repas : ${e.repasParJour * e.jours} × ${euros(e.prixRepas)} = ${euros(montantEnveloppe(e))}`;
+  if (e.type === 'fixe') return `Charge fixe, ${euros(e.montant)}`;
+  return `${euros(e.montant)}${e.cagnotte ? ', peut utiliser la cagnotte' : ''}`;
+}
+
+function rendreReglages() {
+  const vue = $('#vue-reglages');
+  const r = etat.reglages;
+  const envs = r.enveloppes;
+  const fleche = (sens) => `<svg viewBox="0 0 24 24"><path d="${sens === 'haut' ? 'M6 15l6-6 6 6' : 'M6 9l6 6 6-6'}"/></svg>`;
+
+  let html = `<h2>Enveloppes</h2><div class="liste">`;
+  envs.forEach((e, i) => {
+    html += `<div class="ligne">
+      <button class="ligne-texte" data-editer="${e.id}" style="display:flex;align-items:center;gap:12px;text-align:left">
+        <span class="pastille" style="--c:${e.couleur}"></span>
+        <span style="min-width:0"><span class="ligne-titre" style="display:block">${esc(e.nom)}</span>
+        <span class="ligne-sous" style="display:block">${esc(descriptionEnveloppe(e))}</span></span>
+      </button>
+      <span class="fleches">
+        <button data-monter="${i}" aria-label="Monter" ${i === 0 ? 'disabled' : ''}>${fleche('haut')}</button>
+        <button data-descendre="${i}" aria-label="Descendre" ${i === envs.length - 1 ? 'disabled' : ''}>${fleche('bas')}</button>
+      </span>
+    </div>`;
+  });
+  html += `</div><div style="height:10px"></div>
+    <button class="btn btn-discret btn-large" id="ajouter-env">Ajouter une enveloppe</button>
+    <p class="aide">Les changements s'appliquent au mois en cours et aux suivants. Les mois passés ne bougent pas.</p>`;
+
+  // Sauvegarde
+  const derniere = r.derniereSauvegarde
+    ? new Date(r.derniereSauvegarde).toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' })
+    : 'jamais';
+  const protection = persistanceAccordee === true ? 'activée' : persistanceAccordee === false ? 'non accordée par le téléphone (installe l\'appli sur l\'écran d\'accueil)' : 'non disponible';
+  html += `<h2>Sauvegarde</h2>
+    <p class="aide">Tes données restent uniquement dans ce téléphone. Dernière sauvegarde : ${derniere}.</p>
+    <div class="deux-colonnes">
+      <button class="btn btn-principal" data-action="exporter">Exporter mes données</button>
+      <button class="btn btn-discret" id="importer">Importer mes données</button>
+    </div>
+    <p class="aide" style="margin-top:12px">Protection contre l'effacement : ${protection}.<br><span id="espace-utilise"></span></p>`;
+
+  // Conservation
+  html += `<h2>Conservation du détail</h2>
+    <div class="champ"><select id="conservation" aria-label="Durée de conservation">
+      ${[3, 6, 12, 24].map((n) => `<option value="${n}" ${r.conservationMois === n ? 'selected' : ''}>Garder le détail ${n} mois</option>`).join('')}
+    </select></div>
+    <p class="aide">Après cette durée, chaque mois est résumé en une ligne (total dépensé, économies). L'appli reste légère.</p>`;
+
+  // Zone sensible
+  html += `<h2>Effacer</h2>
+    <button class="btn btn-danger btn-large" id="tout-effacer">Effacer toutes les données</button>
+    <p class="aide">Pense à exporter avant. Cette action est définitive.</p>`;
+
+  vue.innerHTML = html;
+
+  $$('[data-editer]', vue).forEach((b) => b.addEventListener('click', () => editerEnveloppe(b.dataset.editer)));
+  $$('[data-monter]', vue).forEach((b) => b.addEventListener('click', () => deplacerEnveloppe(Number(b.dataset.monter), -1)));
+  $$('[data-descendre]', vue).forEach((b) => b.addEventListener('click', () => deplacerEnveloppe(Number(b.dataset.descendre), 1)));
+  $('#ajouter-env', vue).addEventListener('click', () => editerEnveloppe(null));
+  $('#importer', vue).addEventListener('click', () => $('#fichier-import').click());
+  $('#conservation', vue).addEventListener('change', (ev) => {
+    r.conservationMois = Number(ev.target.value);
+    sauver('reglages', r);
+    toast('Durée de conservation enregistrée.');
+  });
+  $('#tout-effacer', vue).addEventListener('click', toutEffacer);
+  brancherActionsCommunes(vue);
+
+  if (navigator.storage && navigator.storage.estimate) {
+    navigator.storage.estimate().then((e) => {
+      const z = $('#espace-utilise');
+      if (z && e.usage != null) z.textContent = `Espace utilisé par l'appli : environ ${Math.max(1, Math.round(e.usage / 1024))} Ko.`;
+    }).catch(() => {});
+  }
+}
+
+function deplacerEnveloppe(i, sens) {
+  const liste = copie(etat.reglages.enveloppes);
+  const j = i + sens;
+  if (j < 0 || j >= liste.length) return;
+  [liste[i], liste[j]] = [liste[j], liste[i]];
+  appliquerEnveloppes(liste);
+  rendreTout();
+}
+
+function editerEnveloppe(id) {
+  const liste = copie(etat.reglages.enveloppes);
+  const existante = id ? liste.find((e) => e.id === id) : null;
+  const utilisees = liste.map((e) => e.couleur);
+  const e = existante || {
+    id: nouvelId(), nom: '', type: 'variable', montant: 0, cagnotte: false,
+    couleur: PALETTE.find((c) => !utilisees.includes(c)) || PALETTE[0]
+  };
+  let montantTxt = e.type === 'repas' ? '' : (e.montant ? montantEnTexte(e.montant) : '');
+  let prixTxt = e.type === 'repas' ? montantEnTexte(e.prixRepas) : '';
+
+  function dessiner() {
+    const estRepas = e.type === 'repas';
+    const typeChoix = estRepas ? '' : `
+      <div class="champ"><span class="etiquette">Type</span><div class="segment">
+        <button data-type="variable" aria-pressed="${e.type === 'variable'}">Variable</button>
+        <button data-type="fixe" aria-pressed="${e.type === 'fixe'}">Charge fixe</button>
+      </div><p class="aide" style="margin:8px 0 0">${e.type === 'fixe' ? 'Payée en une fois : tu la coches quand c\'est fait.' : 'Tu y saisis tes dépenses au fil du mois.'}</p></div>`;
+    const champsRepas = estRepas ? `
+      <div class="champ"><label for="env-prix">Prix d'un repas (€)</label>
+        <input id="env-prix" inputmode="decimal" autocomplete="off" value="${esc(prixTxt)}"></div>
+      <div class="deux-colonnes">
+        <div class="champ"><label for="env-rpj">Repas par jour</label><input id="env-rpj" inputmode="numeric" value="${e.repasParJour}"></div>
+        <div class="champ"><label for="env-jours">Jours par mois</label><input id="env-jours" inputmode="numeric" value="${e.jours}"></div>
+      </div>
+      <p class="aide" id="env-total"></p>` : `
+      <div class="champ"><label for="env-montant">Montant par mois (€)</label>
+        <input id="env-montant" class="montant-saisie" inputmode="decimal" autocomplete="off" placeholder="0,00" value="${esc(montantTxt)}"></div>`;
+    const cagnotte = e.type === 'variable' ? `
+      <label class="interrupteur champ"><span>Peut puiser dans la cagnotte des repas si elle est vide</span>
+        <input type="checkbox" id="env-cagnotte" ${e.cagnotte ? 'checked' : ''}></label>` : '';
+
+    const p = ouvrirPanneau(`
+      ${enteteePanneau(existante ? 'Modifier l\'enveloppe' : 'Nouvelle enveloppe')}
+      <div class="champ"><label for="env-nom">Nom</label>
+        <input id="env-nom" type="text" autocomplete="off" maxlength="40" placeholder="Ex. : Abonnements" value="${esc(e.nom)}"></div>
+      ${typeChoix}
+      ${champsRepas}
+      ${cagnotte}
+      <div class="champ"><span class="etiquette">Couleur</span><div class="palette">
+        ${PALETTE.map((c) => `<button style="--c:${c}" data-couleur="${c}" aria-pressed="${c === e.couleur}" aria-label="Couleur ${c}"></button>`).join('')}
+      </div></div>
+      <button class="btn btn-principal btn-large" id="env-ok">${existante ? 'Enregistrer' : 'Ajouter l\'enveloppe'}</button>
+      ${existante && !estRepas ? '<div style="height:10px"></div><button class="btn btn-danger btn-large" id="env-suppr">Supprimer l\'enveloppe</button>' : ''}
+      ${estRepas ? '<p class="aide">L\'enveloppe des repas ne peut pas être supprimée : elle porte la cagnotte.</p>' : ''}
+    `);
+
+    const lireChamps = () => {
+      e.nom = $('#env-nom', p).value;
+      if (estRepas) {
+        prixTxt = $('#env-prix', p).value;
+        e.repasParJour = parseInt($('#env-rpj', p).value, 10);
+        e.jours = parseInt($('#env-jours', p).value, 10);
+      } else {
+        montantTxt = $('#env-montant', p).value;
+      }
+      if ($('#env-cagnotte', p)) e.cagnotte = $('#env-cagnotte', p).checked;
+    };
+    const majTotal = () => {
+      const z = $('#env-total', p);
+      if (!z) return;
+      lireChamps();
+      const prix = lireMontant(prixTxt);
+      z.textContent = prix > 0 && e.repasParJour > 0 && e.jours > 0
+        ? `Budget nourriture : ${e.repasParJour * e.jours} repas × ${euros(prix)} = ${euros(prix * e.repasParJour * e.jours)}`
+        : 'Vérifie les valeurs.';
+    };
+    $$('#env-prix, #env-rpj, #env-jours', p).forEach((i) => i.addEventListener('input', majTotal));
+    majTotal();
+
+    $$('[data-type]', p).forEach((b) => b.addEventListener('click', () => { lireChamps(); e.type = b.dataset.type; dessiner(); }));
+    $$('[data-couleur]', p).forEach((b) => b.addEventListener('click', () => { lireChamps(); e.couleur = b.dataset.couleur; dessiner(); }));
+    $('#env-ok', p).addEventListener('click', () => { lireChamps(); enregistrer(); });
+    $('#env-suppr', p)?.addEventListener('click', supprimer);
+  }
+
+  function enregistrer() {
+    e.nom = e.nom.trim();
+    if (!e.nom) { toast('Donne un nom à l\'enveloppe.'); return; }
+    if (e.type === 'repas') {
+      const prix = lireMontant(prixTxt);
+      if (!(prix > 0)) { toast('Prix d\'un repas invalide.'); return; }
+      if (!(e.repasParJour >= 1 && e.repasParJour <= 10)) { toast('Repas par jour : entre 1 et 10.'); return; }
+      if (!(e.jours >= 1 && e.jours <= 31)) { toast('Jours par mois : entre 1 et 31.'); return; }
+      e.prixRepas = prix;
+    } else {
+      const m = montantTxt.trim() === '' ? 0 : lireMontant(montantTxt);
+      if (!(m >= 0)) { toast('Montant invalide. Exemple : 450,00'); return; }
+      e.montant = m;
+      if (e.type === 'fixe') delete e.cagnotte;
+      else if (e.cagnotte === undefined) e.cagnotte = false;
+    }
+    if (existante) {
+      const i = liste.findIndex((x) => x.id === e.id);
+      liste[i] = e;
+    } else {
+      liste.push(e);
+    }
+    // Une enveloppe devenue « variable » ne doit plus être cochée comme payée
+    const fiche = assurerMois(cleMois());
+    if (e.type !== 'fixe' && fiche.fixesPayes[e.id]) delete fiche.fixesPayes[e.id];
+    appliquerEnveloppes(liste);
+    fermerPanneau();
+    rendreTout();
+    toast(existante ? 'Enveloppe enregistrée.' : 'Enveloppe ajoutée.');
+  }
+
+  async function supprimer() {
+    const cle = cleMois();
+    const aSupprimer = depensesDuMois(cle).filter((d) => d.envId === e.id);
+    const texte = aSupprimer.length
+      ? `Ses ${aSupprimer.length} dépense(s) de ce mois seront aussi supprimées. Les mois passés ne changent pas.`
+      : 'Les mois passés ne changent pas.';
+    const ok = await confirmer({ titre: `Supprimer « ${existante.nom} » ?`, texte, oui: 'Supprimer', danger: true });
+    if (!ok) return;
+    etat.depenses = etat.depenses.filter((d) => !aSupprimer.includes(d));
+    aSupprimer.forEach((d) => effacer('depenses', d.id));
+    const fiche = assurerMois(cle);
+    delete fiche.fixesPayes[e.id];
+    appliquerEnveloppes(liste.filter((x) => x.id !== e.id));
+    fermerPanneau();
+    rendreTout();
+    toast('Enveloppe supprimée.');
+  }
+
+  dessiner();
+}
+
+async function toutEffacer() {
+  const ok1 = await confirmer({ titre: 'Effacer toutes les données ?', texte: 'Toutes tes dépenses, enveloppes et bilans seront supprimés de ce téléphone.', oui: 'Continuer', danger: true });
+  if (!ok1) return;
+  const ok2 = await confirmer({ titre: 'Dernière confirmation', texte: 'Sans sauvegarde, rien ne pourra être récupéré.', oui: 'Tout effacer', danger: true });
+  if (!ok2) return;
+  try {
+    await remplacerDonnees({ reglages: reglagesParDefaut(), mois: [], depenses: [], bilans: [] });
+    toast('Données effacées.');
+  } catch (e) { erreurStockage(e); }
+}
+
+/* ---------------------------------------------------------
+   13. Export / import (sauvegarde dans un fichier)
+   --------------------------------------------------------- */
+
+function construireExport() {
+  return {
+    application: 'budget',
+    versionSchema: VERSION_SCHEMA,
+    exporteLe: new Date().toISOString(),
+    reglages: etat.reglages,
+    mois: Object.values(etat.mois),
+    depenses: etat.depenses,
+    bilans: etat.bilans
+  };
+}
+
+function marquerSauvegarde() {
+  etat.reglages.derniereSauvegarde = new Date().toISOString();
+  sauver('reglages', etat.reglages);
+  rendreTout();
+  toast('Sauvegarde faite.');
+}
+
+// Important : aucune attente avant le partage, sinon l'iPhone refuse
+// (le partage doit suivre directement l'appui sur le bouton).
+function exporter() {
+  const json = JSON.stringify(construireExport(), null, 1);
+  const nom = `budget-sauvegarde-${aujourdhui()}.json`;
+  let fichier = null;
+  try { fichier = new File([json], nom, { type: 'application/json' }); } catch (e) { fichier = null; }
+
+  if (fichier && navigator.canShare && navigator.canShare({ files: [fichier] })) {
+    navigator.share({ files: [fichier], title: 'Sauvegarde Budget' })
+      .then(marquerSauvegarde)
+      .catch((e) => { if (e && e.name !== 'AbortError') telecharger(json, nom); });
+  } else {
+    telecharger(json, nom);
+  }
+}
+
+function telecharger(json, nom) {
+  const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = nom;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+  marquerSauvegarde();
+}
+
+// Adapte une ancienne sauvegarde au format actuel
+function migrer(donnees) {
+  // Exemple pour plus tard :
+  // if (donnees.versionSchema === 1) { ...transformer...; donnees.versionSchema = 2; }
+  return donnees;
+}
+
+function validerSauvegarde(d) {
+  if (!d || typeof d !== 'object') return 'Ce fichier n\'est pas une sauvegarde valide.';
+  if (d.application !== 'budget') return 'Ce fichier ne vient pas de l\'appli Budget.';
+  if (typeof d.versionSchema !== 'number') return 'Version de sauvegarde inconnue.';
+  if (d.versionSchema > VERSION_SCHEMA) return 'Cette sauvegarde vient d\'une version plus récente de l\'appli. Mets l\'appli à jour d\'abord.';
+  if (!d.reglages || !Array.isArray(d.reglages.enveloppes)) return 'Sauvegarde incomplète : enveloppes manquantes.';
+  if (!Array.isArray(d.depenses) || !Array.isArray(d.mois) || !Array.isArray(d.bilans)) return 'Sauvegarde incomplète.';
+  return null;
+}
+
+async function remplacerDonnees(d) {
+  const reglages = { ...d.reglages, cle: 'principal' };
+  await transaction(['reglages', 'mois', 'depenses', 'bilans'], 'readwrite', (t) => {
+    ['reglages', 'mois', 'depenses', 'bilans'].forEach((m) => t.objectStore(m).clear());
+    t.objectStore('reglages').put(reglages);
+    d.mois.forEach((m) => t.objectStore('mois').put(m));
+    d.depenses.forEach((x) => t.objectStore('depenses').put(x));
+    d.bilans.forEach((b) => t.objectStore('bilans').put(b));
+  });
+  await chargerEtat();
+  assurerMois(cleMois());
+  moisHistorique = null;
+  rendreTout();
+}
+
+async function importerFichier(fichier) {
+  let donnees;
+  try {
+    donnees = JSON.parse(await fichier.text());
+  } catch (e) {
+    alerteMessage('Import impossible', 'Le fichier est illisible. Choisis un fichier « budget-sauvegarde-....json ».');
+    return;
+  }
+  const erreur = validerSauvegarde(donnees);
+  if (erreur) { alerteMessage('Import impossible', erreur); return; }
+  donnees = migrer(donnees);
+  const date = donnees.exporteLe ? new Date(donnees.exporteLe).toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' }) : 'date inconnue';
+  const ok = await confirmer({
+    titre: 'Remplacer les données actuelles ?',
+    texte: `Sauvegarde du ${date} : ${donnees.depenses.length} dépense(s).\nTout ce qui est actuellement dans l'appli sera remplacé.`,
+    oui: 'Remplacer', danger: true
+  });
+  if (!ok) return;
+  try {
+    await remplacerDonnees(donnees);
+    toast('Données importées.');
+  } catch (e) { erreurStockage(e); }
+}
+
+/* ---------------------------------------------------------
+   14. Archivage des vieux mois (pour garder l'appli légère)
+   --------------------------------------------------------- */
+
+function moisAArchiver() {
+  const limite = decalerMois(cleMois(), -etat.reglages.conservationMois);
+  return Object.keys(etat.mois).filter((c) => c < limite).sort();
+}
+
+async function archiver() {
+  const liste = moisAArchiver();
+  if (!liste.length) return;
+  const bilans = liste.map((cle) => {
+    const c = calculerMois(cle);
+    return {
+      mois: cle,
+      budget: c.totalBudget,
+      depense: c.totalConsomme,
+      reste: c.resteGlobal,
+      economies: c.repas ? c.repas.cagnotte : 0,
+      repasPris: c.repas ? c.repas.repasPris : 0,
+      parEnveloppe: etat.mois[cle].enveloppes.map((e) => ({ nom: e.nom, couleur: e.couleur, depense: c.parEnv[e.id].consomme }))
+    };
+  });
+  const aEffacer = etat.depenses.filter((d) => liste.includes(d.mois));
+  try {
+    await transaction(['bilans', 'depenses', 'mois'], 'readwrite', (t) => {
+      bilans.forEach((b) => t.objectStore('bilans').put(b));
+      aEffacer.forEach((d) => t.objectStore('depenses').delete(d.id));
+      liste.forEach((cle) => t.objectStore('mois').delete(cle));
+    });
+  } catch (e) { erreurStockage(e); return; }
+  etat.bilans = [...etat.bilans.filter((b) => !liste.includes(b.mois)), ...bilans].sort((a, b) => a.mois.localeCompare(b.mois));
+  etat.depenses = etat.depenses.filter((d) => !liste.includes(d.mois));
+  liste.forEach((cle) => { delete etat.mois[cle]; });
+  rendreTout();
+  toast(liste.length > 1 ? 'Mois résumés.' : 'Mois résumé.');
+}
+
+/* ---------------------------------------------------------
+   15. Affichage global et démarrage
+   --------------------------------------------------------- */
+
+function rendreVue() {
+  if (vueActive === 'budget') rendreBudget();
+  else if (vueActive === 'historique') rendreHistorique();
+  else if (vueActive === 'stats') rendreStats();
+  else if (vueActive === 'reglages') rendreReglages();
+}
+function rendreTout() {
+  rendreGlobal();
+  rendreVue();
+}
+
+async function demanderPersistance() {
+  try {
+    if (navigator.storage && navigator.storage.persist) {
+      persistanceAccordee = (await navigator.storage.persisted()) || (await navigator.storage.persist());
+    }
+  } catch (e) { persistanceAccordee = null; }
+  if (vueActive === 'reglages') rendreReglages();
+}
+
+function erreurDemarrage(e) {
+  console.error(e);
+  $('#vue-budget').innerHTML = `<div class="bandeau"><p><strong>Impossible d'accéder au stockage du téléphone.</strong></p>
+    <p>Vérifie que Safari n'est pas en navigation privée, puis ferme et rouvre l'appli. Si le problème continue, redémarre le téléphone.</p></div>`;
+}
+
+let dernierJour = aujourdhui();
+
+function brancherInterface() {
+  $$('.onglet').forEach((b) => b.addEventListener('click', () => changerVue(b.dataset.vue)));
+  $('#bouton-ajouter').addEventListener('click', () => ouvrirSaisie());
+  $('#voile').addEventListener('click', fermerPanneau);
+  $('#fichier-import').addEventListener('change', (ev) => {
+    const f = ev.target.files && ev.target.files[0];
+    ev.target.value = '';
+    if (f) importerFichier(f);
+  });
+  // Quand on revient dans l'appli : nouveau jour ou nouveau mois → on met à jour
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    if (aujourdhui() !== dernierJour) {
+      dernierJour = aujourdhui();
+      assurerMois(cleMois());
+      rendreTout();
+    }
+  });
+}
+
+function enregistrerServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  const avaitUneVersion = !!navigator.serviceWorker.controller;
+  let recharge = false;
+  // Une nouvelle version vient d'être installée : on recharge une fois
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!avaitUneVersion || recharge) return;
+    recharge = true;
+    location.reload();
+  });
+  navigator.serviceWorker.register('sw.js').then((reg) => {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') reg.update().catch(() => {});
+    });
+  }).catch((e) => console.warn('Service worker non installé', e));
+}
+
+async function demarrer() {
+  brancherInterface();
+  enregistrerServiceWorker();
+  try {
+    base = await ouvrirBase();
+    await chargerEtat();
+  } catch (e) {
+    erreurDemarrage(e);
+    return;
+  }
+  assurerMois(cleMois());
+  rendreTout();
+  demanderPersistance();
+}
+
+demarrer();
