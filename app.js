@@ -11,13 +11,20 @@
 
 // Version du format des données. À augmenter seulement si on change
 // la forme des données (pour pouvoir relire les anciennes sauvegardes).
-const VERSION_SCHEMA = 2; // v2 : dépenses en devises étrangères
+const VERSION_SCHEMA = 3; // v2 : devises étrangères ; v3 : budget total, réserve et revenus
 
 const BASE_NOM = 'budget-app';
 const BASE_VERSION = 1;
 
 // Couleurs proposées pour les enveloppes (lisibles en clair et en sombre)
-const PALETTE = ['#2A9D8F', '#3D6FB6', '#D19A1F', '#7A5BB5', '#E07A5F', '#5C9A3B', '#5E6B7A', '#C4508C'];
+const PALETTE = ['#1F8A70', '#2F5FA7', '#C58B17', '#7B52A8', '#D0623F', '#5E8A2A', '#56677C', '#B3446F'];
+// Anciennes couleurs (versions 1 à 4) → nouvelles teintes équivalentes
+const ANCIENNES_COULEURS = { '#2A9D8F': '#1F8A70', '#3D6FB6': '#2F5FA7', '#D19A1F': '#C58B17', '#7A5BB5': '#7B52A8', '#E07A5F': '#D0623F', '#5C9A3B': '#5E8A2A', '#5E6B7A': '#56677C', '#C4508C': '#B3446F' };
+function moderniserCouleurs(liste) {
+  let change = false;
+  (liste || []).forEach((e) => { if (ANCIENNES_COULEURS[e.couleur]) { e.couleur = ANCIENNES_COULEURS[e.couleur]; change = true; } });
+  return change;
+}
 
 // Rappel de sauvegarde au-delà de ce nombre de jours
 const JOURS_RAPPEL_SAUVEGARDE = 30;
@@ -294,27 +301,36 @@ const etat = {
 let persistanceAccordee = null;
 
 function reglagesParDefaut() {
-  return {
+  const r = {
     cle: 'principal',
     creeLe: new Date().toISOString(),
     derniereSauvegarde: null,
     conservationMois: 12,
     devises: { favoris: ['EUR', 'MUR'], derniere: 'EUR', fraisPct: 0 },
     enveloppes: [
-      { id: nouvelId(), nom: 'Nourriture', type: 'repas', couleur: '#2A9D8F', prixRepas: 659, repasParJour: 2, jours: 31 },
-      { id: nouvelId(), nom: 'Loisirs', type: 'variable', couleur: '#7A5BB5', montant: 30 * 659, cagnotte: true },
-      { id: nouvelId(), nom: 'Essence', type: 'variable', couleur: '#D19A1F', montant: 0, cagnotte: false },
-      { id: nouvelId(), nom: 'Loyer', type: 'fixe', couleur: '#5E6B7A', montant: 0 },
-      { id: nouvelId(), nom: 'Location voiture', type: 'fixe', couleur: '#3D6FB6', montant: 0 }
+      { id: nouvelId(), nom: 'Nourriture', type: 'repas', couleur: '#1F8A70', prixRepas: 659, repasParJour: 2, jours: 31 },
+      { id: nouvelId(), nom: 'Loisirs', type: 'variable', couleur: '#7B52A8', montant: 30 * 659, cagnotte: true },
+      { id: nouvelId(), nom: 'Essence', type: 'variable', couleur: '#C58B17', montant: 0, cagnotte: false },
+      { id: nouvelId(), nom: 'Loyer', type: 'fixe', couleur: '#56677C', montant: 0 },
+      { id: nouvelId(), nom: 'Location voiture', type: 'fixe', couleur: '#2F5FA7', montant: 0 }
     ]
   };
+  r.budgetTotal = sommeEnveloppes(r.enveloppes);
+  return r;
 }
 
-// Mise à niveau des données d'avant les devises (version 1 → 2)
+// Mise à niveau des anciennes données (v1 → v2 : devises ; v2 → v3 : budget total)
 function completerReglages(r) {
-  if (r.devises) return false;
-  r.devises = { favoris: ['EUR', 'MUR'], derniere: 'EUR', fraisPct: 0 };
-  return true;
+  let change = false;
+  if (!r.devises) {
+    r.devises = { favoris: ['EUR', 'MUR'], derniere: 'EUR', fraisPct: 0 };
+    change = true;
+  }
+  if (typeof r.budgetTotal !== 'number') {
+    r.budgetTotal = sommeEnveloppes(r.enveloppes); // au départ : rien ne change, réserve à 0
+    change = true;
+  }
+  return change;
 }
 function completerDepense(d) {
   if (d.devise) return false;
@@ -338,8 +354,12 @@ async function chargerEtat() {
   if (aCompleter.length) {
     await transaction(['depenses'], 'readwrite', (t) => aCompleter.forEach((d) => t.objectStore('depenses').put(d))).catch(erreurStockage);
   }
+  if (moderniserCouleurs(etat.reglages.enveloppes)) await sauver('reglages', etat.reglages);
   etat.mois = {};
-  mois.forEach((m) => { etat.mois[m.mois] = m; });
+  mois.forEach((m) => {
+    if (moderniserCouleurs(m.enveloppes)) sauver('mois', m);
+    etat.mois[m.mois] = m;
+  });
   etat.depenses = depenses;
   etat.bilans = bilans.sort((a, b) => a.mois.localeCompare(b.mois));
 }
@@ -347,7 +367,7 @@ async function chargerEtat() {
 // Crée la fiche d'un mois (copie des enveloppes actuelles) si elle n'existe pas
 function assurerMois(cle) {
   if (!etat.mois[cle]) {
-    etat.mois[cle] = { mois: cle, enveloppes: copie(etat.reglages.enveloppes), fixesPayes: {} };
+    etat.mois[cle] = { mois: cle, enveloppes: copie(etat.reglages.enveloppes), fixesPayes: {}, budgetTotal: etat.reglages.budgetTotal };
     sauver('mois', etat.mois[cle]);
   }
   return etat.mois[cle];
@@ -359,6 +379,7 @@ function appliquerEnveloppes(liste) {
   sauver('reglages', etat.reglages);
   const m = assurerMois(cleMois());
   m.enveloppes = copie(liste);
+  m.budgetTotal = etat.reglages.budgetTotal;
   sauver('mois', m);
 }
 
@@ -370,33 +391,49 @@ const enveloppeRepas = (liste) => liste.find((e) => e.type === 'repas');
    --------------------------------------------------------- */
 
 const montantEnveloppe = (e) => (e.type === 'repas' ? e.prixRepas * e.repasParJour * e.jours : (e.montant || 0));
-const compteCommeRepas = (d) => d.genre === 'repas' || d.genre === 'maison' || d.genre === 'offert';
+const compteCommeRepas = (d) => !d.revenu && (d.genre === 'repas' || d.genre === 'maison' || d.genre === 'offert');
+const sommeEnveloppes = (liste) => liste.reduce((s, e) => s + montantEnveloppe(e), 0);
+
+// La réserve libre : la part du budget qui n'est dans aucune enveloppe, plus les revenus
+const ID_RESERVE = 'reserve';
+const ENV_RESERVE = { id: ID_RESERVE, nom: 'Réserve', type: 'reserve', couleur: '#A88A45' };
 
 /*
-  Règles de la cagnotte des repas :
-  - chaque repas pris (acheté, fait maison, offert ou sauté) « vaut » le prix d'un repas (6,59 €)
-  - cagnotte = repas pris × prix d'un repas − dépenses de nourriture (repas + courses)
+  Règles :
+  - budget du mois = budget total choisi + revenus du mois
+  - réserve = budget total − somme des enveloppes + revenus ; elle se dépense comme une enveloppe
+  - cagnotte des repas = repas pris × prix d'un repas − dépenses de nourriture
   - si une enveloppe autorisée (ex. Loisirs) dépasse, le dépassement est pris sur la cagnotte
   - si la cagnotte devient négative, ça réduit le budget des repas restants
 */
 function calculerMois(cle, depenses = depensesDuMois(cle)) {
-  const fiche = etat.mois[cle] || { enveloppes: etat.reglages.enveloppes, fixesPayes: {} };
+  const fiche = etat.mois[cle] || { enveloppes: etat.reglages.enveloppes, fixesPayes: {}, budgetTotal: etat.reglages.budgetTotal };
+  const sommeEnv = sommeEnveloppes(fiche.enveloppes);
+  // Les mois d'avant cette version n'ont pas de budget total : on prend la somme des enveloppes
+  const budgetMois = typeof fiche.budgetTotal === 'number' ? fiche.budgetTotal : sommeEnv;
+
   const parEnv = {};
   fiche.enveloppes.forEach((e) => { parEnv[e.id] = { env: e, budget: montantEnveloppe(e), depense: 0 }; });
+  const reserve = { env: ENV_RESERVE, budget: 0, depense: 0 };
+  parEnv[ID_RESERVE] = reserve;
 
+  let revenus = 0;
   let horsEnveloppe = 0; // dépenses d'une enveloppe supprimée depuis
   depenses.forEach((d) => {
+    if (d.revenu) { revenus += d.montant; return; }
     if (parEnv[d.envId]) parEnv[d.envId].depense += d.montant;
     else horsEnveloppe += d.montant;
   });
 
-  let totalBudget = 0;
-  let totalConsomme = horsEnveloppe;
+  reserve.budget = budgetMois - sommeEnv + revenus;
+  reserve.consomme = reserve.depense;
+  reserve.reste = reserve.budget - reserve.depense;
+
+  let totalConsomme = horsEnveloppe + reserve.consomme;
   let surCagnotte = 0;
 
   fiche.enveloppes.forEach((e) => {
     const p = parEnv[e.id];
-    totalBudget += p.budget;
     if (e.type === 'fixe') {
       p.paye = !!fiche.fixesPayes[e.id];
       p.consomme = (p.paye ? p.budget : 0) + p.depense;
@@ -427,13 +464,8 @@ function calculerMois(cle, depenses = depensesDuMois(cle)) {
     repas = p;
   }
 
-  return { parEnv, repas, totalBudget, totalConsomme, resteGlobal: totalBudget - totalConsomme };
-}
-
-// Avancement du mois en cours (0 à 1), pour repérer un rythme trop rapide
-function avancementMois(cle) {
-  if (cle !== cleMois()) return 1;
-  return new Date().getDate() / joursDuMois(cle);
+  const totalBudget = budgetMois + revenus;
+  return { parEnv, repas, reserve, revenus, budgetMois, sommeEnv, totalBudget, totalConsomme, resteGlobal: totalBudget - totalConsomme };
 }
 
 /* ---------------------------------------------------------
@@ -446,8 +478,9 @@ function changerVue(nom) {
   vueActive = nom;
   $$('.onglet').forEach((b) => b.classList.toggle('actif', b.dataset.vue === nom));
   $$('.vue').forEach((v) => { v.hidden = v.id !== 'vue-' + nom; });
-  rendreVue();
   window.scrollTo(0, 0);
+  rendreVue();
+  majBarreHaut();
 }
 
 function ouvrirPanneau(html) {
@@ -511,15 +544,31 @@ function toast(texte) {
    --------------------------------------------------------- */
 
 function rendreGlobal() {
-  const cle = cleMois();
-  const c = calculerMois(cle);
-  $('#global-mois').textContent = 'Reste en ' + nomMois(cle).split(' ')[0];
-  $('#global-sur').textContent = 'sur ' + euros(c.totalBudget);
-  const r = $('#global-reste');
-  r.textContent = euros(c.resteGlobal);
-  r.classList.toggle('negatif', c.resteGlobal < 0);
-  const ratio = c.totalBudget > 0 ? Math.max(0, Math.min(1, c.resteGlobal / c.totalBudget)) : 0;
-  $('#global-barre').style.width = (ratio * 100).toFixed(1) + '%';
+  const c = calculerMois(cleMois());
+  const m = $('#barre-montant');
+  m.textContent = euros(c.resteGlobal);
+  m.classList.toggle('negatif', c.resteGlobal < 0);
+  majBarreHaut();
+}
+
+const TITRES_VUES = { budget: 'Budget', historique: 'Historique', stats: 'Statistiques', reglages: 'Réglages' };
+
+// Sur l'onglet Budget, la barre n'apparaît que quand la carte héros sort de l'écran
+function majBarreHaut() {
+  const barre = $('#barre-haut');
+  const hauteur = barre.offsetHeight;
+  document.body.dataset.vue = vueActive;
+  $('#barre-titre').textContent = TITRES_VUES[vueActive] || 'Budget';
+  // Le petit titre n'apparaît que lorsque le grand titre est sorti de l'écran (comme sur iOS)
+  const grand = $(`#vue-${vueActive} .grand-titre`);
+  barre.classList.toggle('titre-visible', !!grand && grand.getBoundingClientRect().bottom < hauteur);
+  // Onglet Budget : la barre se montre quand le montant de la carte héros n'est plus visible
+  let discret = false;
+  if (vueActive === 'budget') {
+    const montant = $('.heros-montant');
+    discret = !!montant && montant.getBoundingClientRect().bottom > hauteur;
+  }
+  barre.classList.toggle('discret', discret);
 }
 
 /* ---------------------------------------------------------
@@ -541,7 +590,7 @@ function bandeauxInformation() {
   const aArchiver = moisAArchiver();
   if (aArchiver.length) {
     const noms = aArchiver.map((c) => nomMois(c)).join(', ');
-    html += `<div class="bandeau"><p>Le détail de ${esc(noms)} a plus de ${r.conservationMois} mois. Il va être résumé en une ligne de bilan pour garder l'appli légère. Fais une sauvegarde avant si tu veux garder le détail.</p>
+    html += `<div class="bandeau"><p>Le détail de ${esc(noms)} a plus de ${r.conservationMois} mois. Il va être résumé en une ligne pour garder l'appli légère. Sauvegarde avant si tu veux garder le détail.</p>
       <div class="bandeau-boutons">
         <button class="btn btn-petit btn-discret" data-action="exporter">Sauvegarder</button>
         <button class="btn btn-petit btn-principal" data-action="archiver">Résumer</button>
@@ -552,79 +601,97 @@ function bandeauxInformation() {
   const reference = new Date(r.derniereSauvegarde || r.creeLe);
   const jours = Math.floor((Date.now() - reference.getTime()) / 86400000);
   if (jours > JOURS_RAPPEL_SAUVEGARDE) {
-    const texte = r.derniereSauvegarde
-      ? `Ta dernière sauvegarde date de ${jours} jours.`
-      : "Tu n'as encore jamais sauvegardé tes données.";
-    html += `<div class="bandeau"><p>${texte} Une sauvegarde te protège si le téléphone efface les données.</p>
+    const texte = r.derniereSauvegarde ? `Dernière sauvegarde il y a ${jours} jours.` : "Tu n'as encore jamais sauvegardé tes données.";
+    html += `<div class="bandeau"><p>${texte}</p>
       <div class="bandeau-boutons"><button class="btn btn-petit btn-principal" data-action="exporter">Sauvegarder maintenant</button></div></div>`;
   }
   return html;
 }
 
-function carteRepas(p, cle) {
-  const e = p.env;
-  const remplissage = p.budget > 0 ? Math.max(0, Math.min(1, p.reste / p.budget)) : 0;
-  let detail;
-  if (p.repasRestants > 0) {
-    detail = `${p.repasPris} repas pris sur ${p.repasTotal}. Il te reste <span class="chiffre">${euros(p.parRepas)}</span> par repas.`;
-  } else {
-    detail = `${p.repasPris} repas pris sur ${p.repasTotal}.`;
-  }
-  let alerte = '';
-  if (p.reste < 0) alerte = `<div class="env-alerte rouge">Budget nourriture dépassé de ${euros(-p.reste)}.</div>`;
-  else if (p.parRepas !== null && p.parRepas < e.prixRepas * 0.75) alerte = `<div class="env-alerte">Budget par repas serré : vise des repas faits maison.</div>`;
-
-  const cagnotte = p.cagnotte >= 0
-    ? `<span>Économies</span><span class="cagnotte-montant positif">${eurosSigne(p.cagnotte)}</span>`
-    : `<span>À amortir<small>Se rattrape à chaque repas fait maison</small></span><span class="cagnotte-montant negatif">${euros(-p.cagnotte)}</span>`;
-
-  const rapides = cle === cleMois() ? `
-    <div class="rapides">
-      <button class="rapide" data-rapide="repas">Repas acheté</button>
-      <button class="rapide" data-rapide="maison">Fait maison</button>
-    </div>
-    <div class="rapides">
-      <button class="rapide" data-rapide="courses">Courses</button>
-      <button class="rapide" data-rapide="offert">Offert ou sauté</button>
-    </div>` : '';
-
-  return `
-    <div class="env" style="--c:${e.couleur}">
-      <div class="env-niveau" style="width:${(remplissage * 100).toFixed(1)}%"></div>
-      <div class="env-haut">
-        <div class="env-nom"><span class="pastille"></span><span>${esc(e.nom)}</span></div>
-        <div class="env-reste ${p.reste < 0 ? 'negatif' : ''}">${euros(p.reste)}</div>
-      </div>
-      <div class="env-detail">${detail}</div>
-      ${alerte}
-      <div class="cagnotte">${cagnotte}</div>
-      ${rapides}
-    </div>`;
+// Anneau de progression : part restante de l'enveloppe
+function anneau(fraction, couleur, negatif = false) {
+  const r = 16;
+  const circ = 2 * Math.PI * r;
+  const f = Math.max(0, Math.min(1, fraction));
+  return `<svg class="anneau ${negatif ? 'negatif' : ''}" viewBox="0 0 40 40" style="--c:${couleur}" aria-hidden="true">
+    <circle class="piste" cx="20" cy="20" r="${r}" fill="none" stroke-width="5"/>
+    ${negatif ? '' : `<circle class="arc" cx="20" cy="20" r="${r}" fill="none" stroke-width="5" stroke-dasharray="${(f * circ).toFixed(2)} ${circ.toFixed(2)}"/>`}
+  </svg>`;
 }
 
-function carteVariable(p, cle) {
+// Une ligne d'enveloppe : anneau, nom, reste ; détails seulement s'ils sont utiles
+function rangeeEnveloppe(p) {
   const e = p.env;
-  const remplissage = p.budget > 0 ? Math.max(0, Math.min(1, p.reste / p.budget)) : 0;
-  const resteAffiche = p.prisSurCagnotte > 0 ? 0 : p.reste;
-  let detail = `${euros(p.depense)} dépensés sur ${euros(p.budget)}.`;
-  let alerte = '';
-  if (p.prisSurCagnotte > 0) {
-    alerte = `<div class="env-alerte">${euros(p.prisSurCagnotte)} pris sur la cagnotte des repas.</div>`;
+  let reste = p.reste;
+  let gauche = `sur ${euros(p.budget)}`;
+  let droite = '';
+  if (e.type === 'repas') {
+    gauche = p.parRepas !== null ? `${euros(p.parRepas)} par repas` : `${p.repasPris} repas pris`;
+    if (p.reste < 0) droite = `<span class="rouge">Dépassé</span>`;
+    else droite = p.cagnotte >= 0
+      ? `<span class="positif">${eurosSigne(p.cagnotte)} économisés</span>`
+      : `<span class="attention">${euros(-p.cagnotte)} à amortir</span>`;
+  } else if (p.prisSurCagnotte > 0) {
+    reste = 0;
+    droite = `<span class="attention">${euros(p.prisSurCagnotte)} sur les économies</span>`;
   } else if (p.reste < 0) {
-    alerte = `<div class="env-alerte rouge">Dépassé de ${euros(-p.reste)}.</div>`;
-  } else if (p.budget > 0 && p.depense / p.budget > avancementMois(cle) + 0.15) {
-    alerte = `<div class="env-alerte">Tu dépenses plus vite que le mois n'avance.</div>`;
+    droite = `<span class="rouge">Dépassé</span>`;
+  } else if (e.type === 'reserve') {
+    gauche = 'Budget non réparti et revenus';
   }
+  const fraction = p.budget > 0 ? reste / p.budget : 0;
   return `
-    <button class="env" style="--c:${e.couleur}" data-env="${e.id}">
-      <div class="env-niveau" style="width:${(remplissage * 100).toFixed(1)}%"></div>
-      <div class="env-haut">
-        <div class="env-nom"><span class="pastille"></span><span>${esc(e.nom)}</span></div>
-        <div class="env-reste ${resteAffiche < 0 ? 'negatif' : ''}">${euros(resteAffiche)}</div>
-      </div>
-      <div class="env-detail">${detail}</div>
-      ${alerte}
+    <button class="rangee" data-env="${e.id}">
+      ${anneau(fraction, e.couleur, reste < 0)}
+      <span class="env-texte"><span class="env-nom">${esc(e.nom)}</span><span class="env-sous">${gauche}</span></span>
+      <span class="env-droite"><span class="env-reste ${reste < 0 ? 'negatif' : ''}">${euros(reste)}</span>${droite ? `<span class="env-sous">${droite}</span>` : ''}</span>
     </button>`;
+}
+
+// Carte héros : reste du mois, jauge des dépenses courantes et repère du jour
+function carteHeros(c, fiche, cle) {
+  const fixes = fiche.enveloppes.filter((e) => e.type === 'fixe');
+  const budgetFixes = fixes.reduce((s, e) => s + c.parEnv[e.id].budget, 0);
+  const fixesPayes = fixes.reduce((s, e) => s + (c.parEnv[e.id].paye ? c.parEnv[e.id].budget : 0), 0);
+  const fixesAPayer = budgetFixes - fixesPayes;
+  const budgetCourant = c.totalBudget - budgetFixes;
+  const depenseCourante = c.totalConsomme - fixesPayes;
+  const ratioDepense = budgetCourant > 0 ? Math.max(0, Math.min(1, depenseCourante / budgetCourant)) : 1;
+
+  const nbJours = joursDuMois(cle);
+  const jour = new Date().getDate();
+  const ratioTemps = (jour - 0.5) / nbJours;
+  const joursRestants = nbJours - jour + 1;
+  const rapide = ratioDepense > ratioTemps + 0.03;
+
+  const disponible = c.resteGlobal - fixesAPayer;
+  let conseil;
+  if (c.resteGlobal < 0) {
+    conseil = `<span class="alerte-heros">Budget dépassé de ${euros(-c.resteGlobal)}.</span>`;
+  } else if (disponible <= 0) {
+    conseil = `<span class="alerte-heros">Tout ce qui reste est réservé à tes charges fixes.</span>`;
+  } else {
+    conseil = `Environ <strong>${euros(Math.floor(disponible / joursRestants))}</strong> par jour jusqu'à la fin du mois`;
+    conseil += fixesAPayer > 0 ? ', charges fixes déjà mises de côté.' : '.';
+    if (rapide) conseil += ` <span class="alerte-heros">Tu dépenses plus vite que le mois n'avance.</span>`;
+  }
+
+  const posJour = (ratioTemps * 100).toFixed(1);
+  const bord = ratioTemps < 0.12 ? 'bord-gauche' : ratioTemps > 0.88 ? 'bord-droit' : '';
+  return `
+    <section class="heros" aria-label="Reste du mois">
+      <p class="heros-etiquette">Reste ce mois-ci</p>
+      <p class="heros-montant ${c.resteGlobal < 0 ? 'negatif' : ''}">${euros(c.resteGlobal)}</p>
+      <div class="jauge-zone">
+        <span class="jauge-jour-etiquette ${bord}" style="left:${posJour}%">Aujourd'hui</span>
+        <div class="jauge ${rapide ? 'rapide' : ''}" role="img" aria-label="${euros(depenseCourante)} dépensés sur ${euros(budgetCourant)}, jour ${jour} sur ${nbJours}">
+          <div class="jauge-remplie" style="width:${(ratioDepense * 100).toFixed(1)}%"></div>
+          <div class="jauge-jour" style="left:${posJour}%"></div>
+        </div>
+      </div>
+      <div class="heros-legende"><span>${euros(depenseCourante)} dépensés</span><span>sur ${euros(budgetCourant)}</span></div>
+      <p class="heros-conseil">${conseil}</p>
+    </section>`;
 }
 
 function rendreBudget() {
@@ -633,34 +700,34 @@ function rendreBudget() {
   const c = calculerMois(cle);
   const vue = $('#vue-budget');
 
-  let html = bandeauxInformation();
-  html += '<div class="enveloppes">';
-  fiche.enveloppes.filter((e) => e.type !== 'fixe').forEach((e) => {
-    const p = c.parEnv[e.id];
-    html += e.type === 'repas' ? carteRepas(p, cle) : carteVariable(p, cle);
-  });
+  let html = `<h1 class="grand-titre">${majuscule(nomMois(cle).split(' ')[0])}</h1>`;
+  html += carteHeros(c, fiche, cle);
+  html += bandeauxInformation();
+
+  html += '<h2>Enveloppes</h2><div class="liste">';
+  fiche.enveloppes.filter((e) => e.type !== 'fixe').forEach((e) => { html += rangeeEnveloppe(c.parEnv[e.id]); });
+  if (c.reserve.budget !== 0 || c.reserve.depense > 0) html += rangeeEnveloppe(c.reserve);
   html += '</div>';
 
   const fixes = fiche.enveloppes.filter((e) => e.type === 'fixe');
   if (fixes.length) {
-    html += '<h3>Charges fixes</h3><div class="fixes">';
+    html += '<h2>Charges fixes</h2><div class="fixes">';
     fixes.forEach((e) => {
       const paye = !!fiche.fixesPayes[e.id];
       html += `<button class="fixe ${paye ? 'paye' : ''}" style="--c:${e.couleur}" data-fixe="${e.id}" role="checkbox" aria-checked="${paye}">
-        <span class="coche"><svg viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></svg></span>
+        <span class="coche"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></span>
         <span class="fixe-nom">${esc(e.nom)}</span>
         <span class="fixe-montant">${euros(e.montant)}</span>
       </button>`;
     });
-    html += '</div><p class="aide">Coche une charge quand elle est payée : le reste du mois se met à jour.</p>';
+    html += '</div><p class="aide">Coche une charge une fois payée.</p>';
   }
   vue.innerHTML = html;
 
-  // Actions
-  $$('[data-rapide]', vue).forEach((b) => b.addEventListener('click', () => ouvrirSaisie({ genre: b.dataset.rapide })));
   $$('[data-env]', vue).forEach((b) => b.addEventListener('click', () => ouvrirSaisie({ envId: b.dataset.env })));
   $$('[data-fixe]', vue).forEach((b) => b.addEventListener('click', () => basculerFixe(b.dataset.fixe)));
   brancherActionsCommunes(vue);
+  majBarreHaut();
 }
 
 function basculerFixe(id) {
@@ -679,32 +746,28 @@ function brancherActionsCommunes(zone) {
 }
 
 /* ---------------------------------------------------------
-   9. Saisie et modification d'une dépense
+   9. Saisie et modification d'une dépense ou d'un revenu
    --------------------------------------------------------- */
 
 function momentParDefaut() {
   return new Date().getHours() < 16 ? 'midi' : 'soir';
 }
 
-// options : { depense } pour modifier, ou { envId, genre } pour une nouvelle
+// options : { depense } pour modifier, ou { envId, genre, revenu } pour une nouvelle saisie
 function ouvrirSaisie(options = {}) {
   const existante = options.depense || null;
   const mois = existante ? existante.mois : cleMois();
   const fiche = assurerMois(mois);
-  const envsSaisie = fiche.enveloppes.filter((e) => e.type !== 'fixe');
+  // Enveloppes où l'on peut dépenser : les variables, la nourriture et la réserve
+  const envsSaisie = [...fiche.enveloppes.filter((e) => e.type !== 'fixe'), ENV_RESERVE];
   const eRepas = enveloppeRepas(fiche.enveloppes);
   const regDev = etat.reglages.devises;
-
-  if (!envsSaisie.length) {
-    alerteMessage('Aucune enveloppe', 'Ajoute une enveloppe variable dans Réglages pour pouvoir saisir des dépenses.');
-    return;
-  }
-
   const sansMontant = (genre) => genre === 'maison' || genre === 'offert';
 
   // Valeurs du formulaire
   const f = existante ? {
-    envId: existante.envId,
+    sens: existante.revenu ? 'revenu' : 'depense',
+    envId: existante.revenu ? ID_RESERVE : existante.envId,
     genre: existante.genre,
     moment: existante.moment || momentParDefaut(),
     devise: existante.devise || 'EUR',
@@ -714,8 +777,10 @@ function ouvrirSaisie(options = {}) {
     auto: false,
     note: existante.note || '',
     date: existante.date,
+    options: false,
     recherche: false
   } : {
+    sens: options.revenu ? 'revenu' : 'depense',
     envId: options.envId || (eRepas ? eRepas.id : envsSaisie[0].id),
     genre: options.genre || 'repas',
     moment: momentParDefaut(),
@@ -726,9 +791,11 @@ function ouvrirSaisie(options = {}) {
     auto: false,
     note: '',
     date: mois === cleMois() ? aujourdhui() : `${mois}-01`,
+    options: false,
     recherche: false
   };
-  const estRepasEnv = () => eRepas && f.envId === eRepas.id;
+  const estRevenu = () => f.sens === 'revenu';
+  const estRepasEnv = () => !estRevenu() && eRepas && f.envId === eRepas.id;
   const avecMontant = () => !(estRepasEnv() && sansMontant(f.genre));
   const avecMoment = () => estRepasEnv() && f.genre !== 'courses';
 
@@ -764,56 +831,86 @@ function ouvrirSaisie(options = {}) {
   const derniersJour = `${mois}-${deux(joursDuMois(mois))}`;
 
   function dessiner() {
-    const envChoix = envsSaisie.map((e) => `<button style="--c:${e.couleur}" data-choix-env="${e.id}" aria-pressed="${e.id === f.envId}"><span class="pastille"></span>${esc(e.nom)}</button>`).join('');
-    const genreChoix = estRepasEnv() ? `
-      <div class="champ"><span class="etiquette">Type</span><div class="choix">
-        ${Object.entries(GENRES_REPAS).map(([g, nom]) => `<button data-choix-genre="${g}" aria-pressed="${g === f.genre}">${nom}</button>`).join('')}
-      </div></div>` : '';
-    const momentChoix = avecMoment() ? `
+    const titre = existante
+      ? (estRevenu() ? 'Modifier le revenu' : 'Modifier la dépense')
+      : (estRevenu() ? 'Nouveau revenu' : 'Nouvelle dépense');
+    const sens = existante ? '' : `
       <div class="champ"><div class="segment">
-        <button data-moment="midi" aria-pressed="${f.moment === 'midi'}">Midi</button>
-        <button data-moment="soir" aria-pressed="${f.moment === 'soir'}">Soir</button>
-      </div></div>` : '';
+        <button data-sens="depense" aria-pressed="${!estRevenu()}">Dépense</button>
+        <button data-sens="revenu" aria-pressed="${estRevenu()}">Revenu</button>
+      </div></div>`;
 
+    // Montant et devise
     let montant;
     if (avecMontant()) {
       const codes = [...new Set([...regDev.favoris, f.devise])];
       const chips = codes.map((c) => `<button data-devise="${c}" aria-pressed="${c === f.devise}">${esc(symboleDevise(c))} <small>${c}</small></button>`).join('')
-        + `<button data-devise-autre aria-pressed="${f.recherche}">Autre devise</button>`;
+        + `<button data-devise-autre aria-pressed="${f.recherche}">Autre</button>`;
       const recherche = f.recherche ? `
         <div class="recherche-devise">
           <input id="recherche-devise" type="text" autocomplete="off" placeholder="Rechercher : dollar, yen, MUR...">
           <div class="resultats" id="resultats-devise"></div>
         </div>` : '';
       montant = `
-        <div class="champ"><label for="saisie-montant">Montant</label>
-          <div class="choix choix-devises">${chips}</div>
-          ${recherche}
+        <div class="champ">
           <div class="montant-ligne">
-            <input id="saisie-montant" class="montant-saisie" inputmode="decimal" autocomplete="off" placeholder="0" value="${esc(f.montantTxt)}">
+            <input id="saisie-montant" class="montant-saisie" inputmode="decimal" autocomplete="off" placeholder="0" aria-label="Montant" value="${esc(f.montantTxt)}">
             <span class="montant-devise">${esc(f.devise)}</span>
           </div>
           <div class="conversion" id="conversion"></div>
+          <div class="choix choix-petit">${chips}</div>
+          ${recherche}
         </div>`;
     } else {
-      montant = `<p class="aide">Ce repas compte pour ${euros(eRepas.prixRepas)} dans ta cagnotte, sans dépense.</p>`;
+      montant = `<p class="aide">Compte pour ${euros(eRepas.prixRepas)} dans tes économies, sans dépense.</p>`;
     }
 
-    const p = ouvrirPanneau(`
-      ${enteteePanneau(existante ? 'Modifier la dépense' : 'Nouvelle dépense')}
-      <div class="champ"><span class="etiquette">Enveloppe</span><div class="choix">${envChoix}</div></div>
-      ${genreChoix}
-      ${momentChoix}
-      ${montant}
-      <div class="champ"><label for="saisie-note">Note (facultatif)</label>
-        <input id="saisie-note" type="text" autocomplete="off" placeholder="${estRepasEnv() ? 'Ex. : sandwich, resto U' : 'Ex. : cinéma, plein'}" value="${esc(f.note)}"></div>
+    const envChoix = estRevenu() ? '' : `
+      <div class="champ"><div class="choix">
+        ${envsSaisie.map((e) => `<button style="--c:${e.couleur}" data-choix-env="${e.id}" aria-pressed="${e.id === f.envId}"><span class="pastille"></span>${esc(e.nom)}</button>`).join('')}
+      </div></div>`;
+    const genreChoix = estRepasEnv() ? `
+      <div class="champ"><div class="choix choix-petit">
+        ${Object.entries(GENRES_REPAS).map(([g, nom]) => `<button data-choix-genre="${g}" aria-pressed="${g === f.genre}">${nom}</button>`).join('')}
+      </div></div>` : '';
+
+    // Options repliées : moment du repas, note, date
+    const optionsContenu = f.options ? `
+      ${avecMoment() ? `<div class="champ"><div class="segment">
+        <button data-moment="midi" aria-pressed="${f.moment === 'midi'}">Midi</button>
+        <button data-moment="soir" aria-pressed="${f.moment === 'soir'}">Soir</button>
+      </div></div>` : ''}
+      <div class="champ"><label for="saisie-note">Note</label>
+        <input id="saisie-note" type="text" autocomplete="off" placeholder="${estRevenu() ? 'Ex. : babysitting' : 'Ex. : resto U, cinéma'}" value="${esc(f.note)}"></div>
       <div class="champ"><label for="saisie-date">Date</label>
-        <input id="saisie-date" type="date" min="${mois}-01" max="${derniersJour}" value="${f.date}"></div>
+        <input id="saisie-date" type="date" min="${mois}-01" max="${derniersJour}" value="${f.date}"></div>` : '';
+
+    const p = ouvrirPanneau(`
+      ${enteteePanneau(titre)}
+      ${sens}
+      ${montant}
+      ${envChoix}
+      ${genreChoix}
       <div class="apercu" id="apercu"></div>
-      <button class="btn btn-principal btn-large" id="saisie-ok">${existante ? 'Enregistrer les modifications' : 'Ajouter la dépense'}</button>
-      ${existante ? '<div style="height:10px"></div><button class="btn btn-danger btn-large" id="saisie-suppr">Supprimer la dépense</button>' : ''}
+      <button class="btn btn-principal btn-large" id="saisie-ok">${existante ? 'Enregistrer' : 'Ajouter'}</button>
+      <button class="plus-options" id="plus-options" aria-expanded="${f.options}">${f.options ? 'Masquer les options' : (avecMoment() ? 'Midi ou soir, note, date' : 'Note, date')}</button>
+      ${optionsContenu}
+      ${existante ? '<button class="btn btn-danger btn-large" id="saisie-suppr">Supprimer</button>' : ''}
     `);
 
+    $$('[data-sens]', p).forEach((b) => b.addEventListener('click', () => {
+      if (f.sens === b.dataset.sens) return;
+      f.sens = b.dataset.sens;
+      if (estRevenu()) {
+        f.envId = ID_RESERVE;
+        if (f.auto) { f.montantTxt = ''; f.auto = false; }
+      } else {
+        f.envId = eRepas ? eRepas.id : envsSaisie[0].id;
+        f.genre = estRepasEnv() ? 'repas' : 'libre';
+        if (estRepasEnv() && !f.montantTxt) preremplir();
+      }
+      dessiner();
+    }));
     $$('[data-choix-env]', p).forEach((b) => b.addEventListener('click', () => {
       f.envId = b.dataset.choixEnv;
       if (estRepasEnv()) {
@@ -821,6 +918,7 @@ function ouvrirSaisie(options = {}) {
         if (!f.montantTxt) preremplir();
       } else {
         f.genre = 'libre';
+        if (f.auto) { f.montantTxt = ''; f.auto = false; }
       }
       dessiner();
     }));
@@ -849,11 +947,12 @@ function ouvrirSaisie(options = {}) {
       champRecherche.addEventListener('input', () => afficherResultatsDevises(zone, champRecherche.value, choisir));
       afficherResultatsDevises(zone, '', choisir);
     }
+    $('#plus-options', p).addEventListener('click', () => { f.options = !f.options; dessiner(); });
 
     const champMontant = $('#saisie-montant', p);
     if (champMontant) champMontant.addEventListener('input', () => { f.montantTxt = champMontant.value; f.auto = false; majApercu(); });
-    $('#saisie-note', p).addEventListener('input', (ev) => { f.note = ev.target.value; });
-    $('#saisie-date', p).addEventListener('change', (ev) => { f.date = ev.target.value; majApercu(); });
+    $('#saisie-note', p)?.addEventListener('input', (ev) => { f.note = ev.target.value; });
+    $('#saisie-date', p)?.addEventListener('change', (ev) => { f.date = ev.target.value; majApercu(); });
     $('#saisie-ok', p).addEventListener('click', valider);
     if (existante) $('#saisie-suppr', p).addEventListener('click', supprimerDepense);
     majApercu();
@@ -861,7 +960,7 @@ function ouvrirSaisie(options = {}) {
 
   const tauxManquant = () => avecMontant() && f.devise !== 'EUR' && !f.taux;
 
-  // Construit la dépense à partir du formulaire (ou null si invalide)
+  // Construit l'enregistrement à partir du formulaire (ou null si invalide)
   function construire() {
     let montant = 0;
     let devise = 'EUR';
@@ -878,17 +977,17 @@ function ouvrirSaisie(options = {}) {
       } else {
         if (!f.taux) return null;
         taux = f.taux;
-        frais = f.frais || 0;
+        frais = estRevenu() ? 0 : (f.frais || 0); // pas de frais ajoutés sur un revenu
         const dec = decimalesDevise(devise);
         montantOrigine = Math.round(v * 10 ** dec) / 10 ** dec;
         montant = Math.max(1, versEuros(montantOrigine, devise, taux, frais));
       }
     }
     const date = f.date && f.date.startsWith(mois) ? f.date : (mois === cleMois() ? aujourdhui() : `${mois}-01`);
-    return {
+    const enreg = {
       id: existante ? existante.id : nouvelId(),
-      envId: f.envId,
-      genre: estRepasEnv() ? f.genre : 'libre',
+      envId: estRevenu() ? ID_RESERVE : f.envId,
+      genre: estRevenu() ? 'revenu' : (estRepasEnv() ? f.genre : 'libre'),
       moment: avecMoment() ? f.moment : null,
       montant,          // en centimes d'euro : c'est ce montant qui compte dans le budget
       devise,           // devise de saisie (EUR, MUR...)
@@ -900,13 +999,20 @@ function ouvrirSaisie(options = {}) {
       mois,
       creeLe: existante ? existante.creeLe : new Date().toISOString()
     };
+    if (estRevenu()) enreg.revenu = true; // un revenu augmente le budget (va dans la réserve)
+    return enreg;
   }
 
-  // Calcule l'effet de la dépense et prépare le message d'aperçu
+  // Calcule l'effet de la saisie et prépare le message d'aperçu
   function analyser(dep) {
     const autres = depensesDuMois(mois).filter((d) => !existante || d.id !== existante.id);
     const avant = calculerMois(mois, autres);
     const apres = calculerMois(mois, dep ? [...autres, dep] : autres);
+
+    if (estRevenu()) {
+      return { niveau: 'ok', texte: `Ta réserve passera à <strong>${euros(apres.reserve.reste)}</strong>, ton budget du mois à <strong>${euros(apres.totalBudget)}</strong>.` };
+    }
+
     const pA = apres.parEnv[f.envId];
     const e = pA.env;
     let texte = '';
@@ -915,30 +1021,23 @@ function ouvrirSaisie(options = {}) {
     if (e.type === 'repas') {
       const r = apres.repas;
       texte = r.repasRestants > 0
-        ? `Après : <strong>${euros(r.reste)}</strong> pour ${r.repasRestants} repas restants, soit <strong>${euros(r.parRepas)}</strong> par repas.`
-        : `Après : il reste <strong>${euros(r.reste)}</strong> dans l'enveloppe.`;
-      texte += r.cagnotte >= 0
-        ? ` Économies : <strong>${eurosSigne(r.cagnotte)}</strong>.`
-        : ` À amortir : <strong>${euros(-r.cagnotte)}</strong>.`;
+        ? `Il restera <strong>${euros(r.reste)}</strong>, soit <strong>${euros(r.parRepas)}</strong> par repas.`
+        : `Il restera <strong>${euros(r.reste)}</strong>.`;
       if (r.reste < 0 && r.reste < avant.repas.reste) {
         niveau = 'alerte';
-        texte = `Cette dépense fait dépasser le budget nourriture de <strong>${euros(-r.reste)}</strong>.`;
+        texte = `Ça dépasse le budget nourriture de <strong>${euros(-r.reste)}</strong>.`;
       }
+    } else if (e.cagnotte && pA.prisSurCagnotte > 0) {
+      const r = apres.repas;
+      niveau = 'attention';
+      texte = `Enveloppe vide : <strong>${euros(pA.prisSurCagnotte)}</strong> seront pris sur tes économies de repas.`;
+      if (r && r.cagnotte < 0) texte += ` Ton budget par repas passera à <strong>${euros(r.parRepas || 0)}</strong>.`;
+      if (!r) { niveau = 'alerte'; texte = `Ça dépasse ${esc(e.nom)} de <strong>${euros(pA.depassement)}</strong>.`; }
+    } else if (pA.reste < 0) {
+      niveau = 'alerte';
+      texte = `Ça dépasse ${esc(e.nom)} de <strong>${euros(-pA.reste)}</strong>.`;
     } else {
-      if (e.cagnotte && pA.prisSurCagnotte > 0) {
-        const r = apres.repas;
-        texte = `Enveloppe vide : <strong>${euros(pA.prisSurCagnotte)}</strong> seront pris sur la cagnotte des repas.`;
-        niveau = 'attention';
-        if (r && r.cagnotte < 0) {
-          texte += ` La cagnotte ne suffit pas : le budget par repas passera à <strong>${euros(r.parRepas || 0)}</strong>.`;
-        }
-        if (!r) { niveau = 'alerte'; texte = `Cette dépense fait dépasser ${esc(e.nom)} de <strong>${euros(pA.depassement)}</strong>.`; }
-      } else if (pA.reste < 0) {
-        niveau = 'alerte';
-        texte = `Cette dépense fait dépasser ${esc(e.nom)} de <strong>${euros(-pA.reste)}</strong>.`;
-      } else {
-        texte = `Après : il restera <strong>${euros(pA.reste)}</strong> dans ${esc(e.nom)}.`;
-      }
+      texte = `Il restera <strong>${euros(pA.reste)}</strong> dans ${esc(e.nom)}.`;
     }
     if (apres.resteGlobal < 0 && apres.resteGlobal < avant.resteGlobal) {
       niveau = 'alerte';
@@ -955,16 +1054,16 @@ function ouvrirSaisie(options = {}) {
     if (!zone) return;
     if (f.devise === 'EUR') { zone.textContent = ''; return; }
     if (!f.taux) {
-      zone.innerHTML = `<span class="rouge">Taux inconnu pour ${esc(nomDevise(f.devise))}. Connecte-toi à internet une fois pour le récupérer.</span>`;
+      zone.innerHTML = `<span class="rouge">Taux inconnu pour ${esc(nomDevise(f.devise))}. Connecte-toi une fois à internet.</span>`;
       return;
     }
     const v = lireNombre(f.montantTxt);
+    const frais = estRevenu() ? 0 : f.frais;
     const fige = existante && (existante.devise || 'EUR') === f.devise;
-    const source = fige ? 'taux du jour de saisie' : (etat.taux ? `taux du ${dateCourte(etat.taux.majLe)}` : 'dernier taux connu');
-    let t = v > 0 ? `≈ ${euros(Math.max(1, versEuros(v, f.devise, f.taux, f.frais)))}. ` : '';
-    t += `1 € = ${afficherTaux(f.taux, f.devise)}, ${source}`;
-    if (f.frais) t += `, frais de ${String(f.frais).replace('.', ',')} % compris`;
-    zone.textContent = t + '.';
+    let t = v > 0 ? `≈ ${euros(Math.max(1, versEuros(v, f.devise, f.taux, frais)))}` : `1 € = ${afficherTaux(f.taux, f.devise)}`;
+    t += fige ? ' (taux du jour de saisie)' : (etat.taux ? ` (taux du ${dateCourte(etat.taux.majLe)})` : '');
+    if (frais) t += `, frais ${String(frais).replace('.', ',')} % compris`;
+    zone.textContent = t;
   }
 
   function majApercu() {
@@ -1012,17 +1111,18 @@ function ouvrirSaisie(options = {}) {
     }
     fermerPanneau();
     rendreTout();
-    toast(existante ? 'Dépense modifiée.' : 'Dépense ajoutée.');
+    toast(estRevenu() ? (existante ? 'Revenu modifié.' : 'Revenu ajouté.') : (existante ? 'Dépense modifiée.' : 'Dépense ajoutée.'));
   }
 
   async function supprimerDepense() {
-    const ok = await confirmer({ titre: 'Supprimer cette dépense ?', texte: 'Elle sera retirée de ton budget. Cette action est définitive.', oui: 'Supprimer', danger: true });
+    const quoi = estRevenu() ? 'ce revenu' : 'cette dépense';
+    const ok = await confirmer({ titre: `Supprimer ${quoi} ?`, texte: 'Cette action est définitive.', oui: 'Supprimer', danger: true });
     if (!ok) return;
     etat.depenses = etat.depenses.filter((d) => d.id !== existante.id);
     effacer('depenses', existante.id);
     fermerPanneau();
     rendreTout();
-    toast('Dépense supprimée.');
+    toast('Supprimé.');
   }
 
   dessiner();
@@ -1035,6 +1135,7 @@ function ouvrirSaisie(options = {}) {
 let moisHistorique = null;
 
 function titreDepense(d, env) {
+  if (d.revenu) return d.note || 'Revenu';
   if (env && env.type === 'repas') {
     const genre = GENRES_REPAS[d.genre] || 'Dépense';
     if (d.genre === 'courses') return d.note ? `Courses, ${d.note}` : 'Courses';
@@ -1042,16 +1143,6 @@ function titreDepense(d, env) {
     return [moment, genre.toLowerCase()].filter(Boolean).join(', ') + (d.note ? ` (${d.note})` : '');
   }
   return d.note || (env ? env.nom : 'Dépense');
-}
-
-function tuilesResume(c) {
-  const r = c.repas;
-  return `<div class="resume">
-    <div class="tuile"><div class="tuile-etiquette">Dépensé</div><div class="tuile-valeur">${euros(c.totalConsomme)}</div></div>
-    <div class="tuile"><div class="tuile-etiquette">Reste</div><div class="tuile-valeur ${c.resteGlobal < 0 ? 'negatif' : ''}">${euros(c.resteGlobal)}</div></div>
-    ${r ? `<div class="tuile"><div class="tuile-etiquette">Économies repas</div><div class="tuile-valeur ${r.cagnotte >= 0 ? 'positif' : 'negatif'}">${eurosSigne(r.cagnotte)}</div></div>
-    <div class="tuile"><div class="tuile-etiquette">Repas pris</div><div class="tuile-valeur">${r.repasPris} / ${r.repasTotal}</div></div>` : ''}
-  </div>`;
 }
 
 function rendreHistorique() {
@@ -1063,38 +1154,46 @@ function rendreHistorique() {
   const c = calculerMois(cle);
   const deps = depensesDuMois(cle).sort((a, b) => (b.date + b.creeLe).localeCompare(a.date + a.creeLe));
 
-  let html = '';
+  let html = '<h1 class="grand-titre">Historique</h1>';
   if (moisDispo.length > 1) {
     html += `<div class="champ"><select id="choix-mois" aria-label="Mois">
       ${moisDispo.map((m) => `<option value="${m}" ${m === cle ? 'selected' : ''}>${majuscule(nomMois(m))}</option>`).join('')}
     </select></div>`;
   } else {
-    html += `<h2>${majuscule(nomMois(cle))}</h2>`;
+    html += `<p class="aide">${majuscule(nomMois(cle))}</p>`;
   }
-  html += tuilesResume(c);
+  html += `<div class="resume">
+    <div class="tuile"><div class="tuile-etiquette">Dépensé</div><div class="tuile-valeur">${euros(c.totalConsomme)}</div></div>
+    <div class="tuile"><div class="tuile-etiquette">Reste</div><div class="tuile-valeur ${c.resteGlobal < 0 ? 'negatif' : ''}">${euros(c.resteGlobal)}</div></div>
+  </div>`;
+  if (c.revenus > 0) html += `<p class="aide">Dont ${euros(c.revenus)} de revenus ajoutés ce mois-ci.</p>`;
 
   if (!deps.length) {
-    html += `<div class="vide">Aucune dépense ce mois-ci. Appuie sur + pour ajouter la première.</div>`;
+    html += `<div class="vide">Rien ce mois-ci. Appuie sur + pour commencer.</div>`;
   } else {
     let jourCourant = null;
-    html += '<div>';
     deps.forEach((d) => {
       if (d.date !== jourCourant) {
         if (jourCourant) html += '</div>';
         jourCourant = d.date;
         html += `<div class="jour">${esc(nomJour(d.date))}</div><div class="liste">`;
       }
-      const env = fiche.enveloppes.find((e) => e.id === d.envId);
+      const env = d.envId === ID_RESERVE ? ENV_RESERVE : fiche.enveloppes.find((e) => e.id === d.envId);
       const gratuit = compteCommeRepas(d) && d.montant === 0;
       const origine = d.devise && d.devise !== 'EUR' ? `<span class="ligne-orig">${esc(formatDevise(d.montantOrigine, d.devise))}</span>` : '';
+      const valeur = d.revenu ? `+${euros(d.montant)}` : (gratuit ? '0 €' : euros(d.montant));
       html += `<button class="ligne" data-dep="${d.id}">
-        <span class="pastille" style="--c:${env ? env.couleur : '#999'}"></span>
+        <span class="pastille" style="--c:${d.revenu ? 'var(--vert)' : (env ? env.couleur : '#999')}"></span>
         <span class="ligne-texte"><span class="ligne-titre">${esc(titreDepense(d, env))}</span>
-        <span class="ligne-sous">${esc(env ? env.nom : 'Enveloppe supprimée')}</span></span>
-        <span class="ligne-valeur ${gratuit ? 'zero' : ''}"><span>${gratuit ? '0 €' : euros(d.montant)}</span>${origine}</span>
+        ${(() => {
+          const titre = titreDepense(d, env);
+          const sous = d.revenu ? 'Ajouté à la réserve' : (env ? (env.nom === titre ? '' : env.nom) : 'Enveloppe supprimée');
+          return sous ? `<span class="ligne-sous">${esc(sous)}</span>` : '';
+        })()}</span>
+        <span class="ligne-valeur ${gratuit || d.revenu ? 'zero' : ''}"><span>${valeur}</span>${origine}</span>
       </button>`;
     });
-    html += '</div></div>';
+    html += '</div>';
   }
 
   if (etat.bilans.length) {
@@ -1102,9 +1201,9 @@ function rendreHistorique() {
     [...etat.bilans].reverse().forEach((b) => {
       html += `<div class="ligne"><span class="ligne-texte"><span class="ligne-titre">${majuscule(nomMois(b.mois))}</span>
         <span class="ligne-sous">Dépensé ${euros(b.depense)} sur ${euros(b.budget)}</span></span>
-        <span class="ligne-valeur ${b.economies >= 0 ? 'zero' : ''}">${eurosSigne(b.economies)}</span></div>`;
+        <span class="ligne-valeur ${b.economies >= 0 ? 'zero' : ''}"><span>${eurosSigne(b.economies)}</span><span class="ligne-orig">économies repas</span></span></div>`;
     });
-    html += '</div><p class="aide">Montant à droite : économies faites sur les repas.</p>';
+    html += '</div>';
   }
 
   vue.innerHTML = html;
@@ -1133,7 +1232,7 @@ function graphiqueAnneau(parts) {
   const legende = parts.map((p) => `<div><span class="pastille" style="--c:${p.couleur}"></span>${esc(p.nom)}
     <span class="chiffre">${euros(p.valeur)}</span></div>`).join('');
   return `<svg viewBox="0 0 42 42" style="max-width:200px;margin:0 auto" role="img" aria-label="Répartition des dépenses">${arcs}
-    <text x="21" y="22.5" text-anchor="middle" font-size="4.2" font-weight="600" style="fill:var(--encre)">${euros(total)}</text></svg>
+    <text x="21" y="22.6" text-anchor="middle" font-size="4.4" font-weight="800" style="fill:var(--encre)">${euros(total)}</text></svg>
     <div class="legende">${legende}</div>`;
 }
 
@@ -1164,41 +1263,16 @@ function rendreStats() {
   const cle = cleMois();
   const fiche = assurerMois(cle);
   const c = calculerMois(cle);
-  const deps = depensesDuMois(cle);
-  let html = `<h2>${majuscule(nomMois(cle))}</h2>`;
+  let html = `<h1 class="grand-titre">Statistiques</h1><p class="aide">${majuscule(nomMois(cle))}</p>`;
 
   // 1. Où part l'argent
-  const parts = fiche.enveloppes
+  const parts = [...fiche.enveloppes, ENV_RESERVE]
     .map((e) => ({ nom: e.nom, couleur: e.couleur, valeur: c.parEnv[e.id].consomme }))
     .filter((p) => p.valeur > 0)
     .sort((a, b) => b.valeur - a.valeur);
-  html += `<h3>Où part ton argent</h3><div class="graphique">${graphiqueAnneau(parts)}</div>`;
+  html += `<h2>Où part ton argent</h2><div class="graphique">${graphiqueAnneau(parts)}</div>`;
 
-  // 2. Dépenses jour par jour (hors charges fixes)
-  const nbJours = joursDuMois(cle);
-  const parJour = Array(nbJours).fill(0);
-  deps.forEach((d) => { const j = Number(d.date.slice(8, 10)); if (j >= 1 && j <= nbJours) parJour[j - 1] += d.montant; });
-  const totalJour = parJour.reduce((s, v) => s + v, 0);
-  const jourActuel = new Date().getDate();
-  html += `<h3>Dépenses jour par jour</h3><div class="graphique">
-    ${graphiqueBarres(parJour.map((v) => v / 100), parJour.map((_, i) => String(i + 1)), { etiquetteTous: 5 })}
-    <p class="aide" style="margin:10px 0 0">Moyenne : ${euros(Math.round(totalJour / Math.max(1, jourActuel)))} par jour depuis le début du mois (charges fixes non comprises).</p></div>`;
-
-  // 3. Les repas
-  const eRepas = enveloppeRepas(fiche.enveloppes);
-  if (eRepas && c.repas) {
-    const dRepas = deps.filter((d) => d.envId === eRepas.id);
-    const compte = (g) => dRepas.filter((d) => d.genre === g).length;
-    const moyenne = c.repas.repasPris > 0 ? Math.round(c.repas.depense / c.repas.repasPris) : 0;
-    html += `<h3>Tes repas</h3><div class="resume">
-      <div class="tuile"><div class="tuile-etiquette">Achetés</div><div class="tuile-valeur">${compte('repas')}</div></div>
-      <div class="tuile"><div class="tuile-etiquette">Faits maison</div><div class="tuile-valeur">${compte('maison')}</div></div>
-      <div class="tuile"><div class="tuile-etiquette">Offerts ou sautés</div><div class="tuile-valeur">${compte('offert')}</div></div>
-      <div class="tuile"><div class="tuile-etiquette">Coût moyen</div><div class="tuile-valeur">${euros(moyenne)}</div></div>
-    </div><p class="aide">Coût moyen = dépenses de nourriture (courses comprises) divisées par le nombre de repas pris. Objectif : rester sous ${euros(eRepas.prixRepas)}.</p>`;
-  }
-
-  // 4. Économies mois après mois
+  // 2. Économies mois après mois
   const serie = [];
   etat.bilans.forEach((b) => serie.push({ mois: b.mois, valeur: b.economies }));
   Object.keys(etat.mois).sort().forEach((m) => {
@@ -1206,13 +1280,11 @@ function rendreStats() {
     serie.push({ mois: m, valeur: r ? r.cagnotte : 0 });
   });
   const derniers = serie.slice(-12);
-  if (derniers.length > 1) {
-    html += `<h3>Économies mois après mois</h3><div class="graphique">
-      ${graphiqueBarres(derniers.map((s) => s.valeur / 100), derniers.map((s) => nomMois(s.mois, true).replace('.', '')))}
-      <p class="aide" style="margin:10px 0 0">Économies faites sur les repas. Le dernier mois est en cours.</p></div>`;
-  } else {
-    html += `<h3>Économies mois après mois</h3><div class="graphique"><div class="vide">Ce graphique apparaîtra à partir du mois prochain.</div></div>`;
-  }
+  html += '<h2>Économies sur les repas</h2><div class="graphique">';
+  html += derniers.length > 1
+    ? graphiqueBarres(derniers.map((s) => s.valeur / 100), derniers.map((s) => nomMois(s.mois, true).replace('.', '')))
+    : `<div class="vide">Ce graphique apparaîtra le mois prochain. Ce mois-ci : ${c.repas ? eurosSigne(c.repas.cagnotte) : '0 €'}.</div>`;
+  html += '</div>';
   vue.innerHTML = html;
 }
 
@@ -1220,47 +1292,69 @@ function rendreStats() {
    12. Onglet Réglages
    --------------------------------------------------------- */
 
-function descriptionEnveloppe(e) {
-  if (e.type === 'repas') return `Repas : ${e.repasParJour * e.jours} × ${euros(e.prixRepas)} = ${euros(montantEnveloppe(e))}`;
-  if (e.type === 'fixe') return `Charge fixe, ${euros(e.montant)}`;
-  return `${euros(e.montant)}${e.cagnotte ? ', peut utiliser la cagnotte' : ''}`;
+let rechercheFavori = false;
+
+function sousTexteEnveloppe(e) {
+  if (e.type === 'repas') return `Prix d'un repas, soit ${euros(montantEnveloppe(e))} par mois`;
+  if (e.type === 'fixe') return 'Charge fixe';
+  return e.cagnotte ? 'Peut utiliser les économies' : 'Variable';
 }
 
-let rechercheFavori = false;
+// Texte sous le budget total : comment il se répartit
+function texteRepartition(budget) {
+  const somme = sommeEnveloppes(etat.reglages.enveloppes);
+  if (!(budget >= 0)) return '<span class="rouge">Montant invalide.</span>';
+  const reserve = budget - somme;
+  if (reserve < 0) return `<span class="rouge">Tes enveloppes (${euros(somme)}) dépassent ce budget de ${euros(-reserve)}.</span> <button class="lien" id="ajuster-budget">Mettre le budget à ${euros(somme)}</button>`;
+  return `Enveloppes : ${euros(somme)}. Réserve libre : ${euros(reserve)}.`;
+}
 
 function rendreReglages() {
   const vue = $('#vue-reglages');
   const r = etat.reglages;
-  const envs = r.enveloppes;
-  const fleche = (sens) => `<svg viewBox="0 0 24 24"><path d="${sens === 'haut' ? 'M6 15l6-6 6 6' : 'M6 9l6 6 6-6'}"/></svg>`;
+  const dev = r.devises;
 
-  let html = `<h2>Enveloppes</h2><div class="liste">`;
-  envs.forEach((e, i) => {
-    html += `<div class="ligne">
-      <button class="ligne-texte" data-editer="${e.id}" style="display:flex;align-items:center;gap:12px;text-align:left">
+  // Budget total
+  let html = `<h1 class="grand-titre">Réglages</h1>
+    <h2>Budget du mois</h2>
+    <div class="budget-carte">
+      <div class="montant-ligne">
+        <input id="budget-total" class="montant-saisie" inputmode="decimal" autocomplete="off" aria-label="Budget du mois" value="${montantEnTexte(r.budgetTotal)}">
+        <span class="montant-devise">EUR</span>
+      </div>
+      <p class="aide" id="repartition">${texteRepartition(r.budgetTotal)}</p>
+    </div>`;
+
+  // Enveloppes : montant modifiable directement, crayon pour le reste
+  const crayon = '<svg class="crayon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16v4zM14 6l4 4"/></svg>';
+  html += `<h2>Enveloppes</h2>
+    <p class="aide">Touche un montant pour le changer. Touche un nom pour le renommer, changer sa couleur ou le supprimer.</p>
+    <div class="liste">`;
+  r.enveloppes.forEach((e) => {
+    const valeur = e.type === 'repas' ? montantEnTexte(e.prixRepas) : montantEnTexte(e.montant || 0);
+    html += `<div class="ligne ligne-env">
+      <button class="bouton-nom" data-editer="${e.id}" aria-label="Modifier ${esc(e.nom)}">
         <span class="pastille" style="--c:${e.couleur}"></span>
-        <span style="min-width:0"><span class="ligne-titre" style="display:block">${esc(e.nom)}</span>
-        <span class="ligne-sous" style="display:block">${esc(descriptionEnveloppe(e))}</span></span>
+        <span class="ligne-texte"><span class="ligne-titre">${esc(e.nom)}${crayon}</span>
+        <span class="ligne-sous" id="sous-${e.id}">${esc(sousTexteEnveloppe(e))}</span></span>
       </button>
-      <span class="fleches">
-        <button data-monter="${i}" aria-label="Monter" ${i === 0 ? 'disabled' : ''}>${fleche('haut')}</button>
-        <button data-descendre="${i}" aria-label="Descendre" ${i === envs.length - 1 ? 'disabled' : ''}>${fleche('bas')}</button>
-      </span>
+      <label class="montant-inline">
+        <input data-montant-env="${e.id}" inputmode="decimal" autocomplete="off" value="${valeur}"
+          aria-label="${e.type === 'repas' ? 'Prix d\'un repas' : 'Montant de ' + esc(e.nom)}">
+        <span>€</span>
+      </label>
     </div>`;
   });
   html += `</div><div style="height:10px"></div>
-    <button class="btn btn-discret btn-large" id="ajouter-env">Ajouter une enveloppe</button>
-    <p class="aide">Les changements s'appliquent au mois en cours et aux suivants. Les mois passés ne bougent pas.</p>`;
+    <button class="btn btn-discret btn-large" id="ajouter-env">Ajouter une enveloppe</button>`;
 
   // Devises
-  const dev = r.devises;
   html += `<h2>Devises</h2>
-    <p class="aide">Saisis tes dépenses dans n'importe quelle devise : elles sont converties en euros au taux du jour, puis ce taux reste figé pour chaque dépense.</p>
-    <div class="champ"><span class="etiquette">Boutons rapides lors de la saisie</span><div class="choix">
+    <div class="champ"><span class="etiquette">Boutons rapides</span><div class="choix">
       ${dev.favoris.map((c) => c === 'EUR'
         ? `<button disabled aria-pressed="false">${esc(symboleDevise(c))} <small>EUR</small></button>`
         : `<button data-retirer-favori="${c}" aria-label="Retirer ${c}">${esc(symboleDevise(c))} <small>${c}</small> ✕</button>`).join('')}
-      <button id="ajouter-favori" aria-pressed="${rechercheFavori}">Ajouter une devise</button>
+      <button id="ajouter-favori" aria-pressed="${rechercheFavori}">Ajouter</button>
     </div>
     ${rechercheFavori ? `<div class="recherche-devise" style="margin-top:10px">
       <input id="recherche-favori" type="text" autocomplete="off" placeholder="Rechercher : dollar, yen, MUR...">
@@ -1268,49 +1362,87 @@ function rendreReglages() {
     </div>
     <div class="champ"><label for="frais">Frais de change de ta banque (%)</label>
       <input id="frais" inputmode="decimal" autocomplete="off" value="${String(dev.fraisPct || 0).replace('.', ',')}"></div>
-    <p class="aide">Ajoutés aux dépenses en devise étrangère, pour coller au montant réellement débité. Laisse 0 si tu ne sais pas.</p>
-    <p class="aide">${etat.taux ? `Taux du ${dateLongue(etat.taux.majLe)}, mis à jour une fois par jour quand tu es connecté.` : 'Aucun taux téléchargé pour l\'instant : connecte-toi à internet.'}</p>
-    <button class="btn btn-discret btn-large" id="maj-taux">Mettre à jour les taux</button>
-    <p class="aide" style="margin-top:10px"><a href="https://www.exchangerate-api.com" target="_blank" rel="noopener">Rates By Exchange Rate API</a></p>`;
+    <p class="aide">${etat.taux ? `Taux du ${dateLongue(etat.taux.majLe)}.` : 'Aucun taux pour l\'instant : connecte-toi à internet.'}
+      <button class="lien" id="maj-taux">Mettre à jour</button><br>
+      <a href="https://www.exchangerate-api.com" target="_blank" rel="noopener">Rates By Exchange Rate API</a></p>`;
 
   // Sauvegarde
-  const derniere = r.derniereSauvegarde
-    ? new Date(r.derniereSauvegarde).toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' })
-    : 'jamais';
-  const protection = persistanceAccordee === true ? 'activée' : persistanceAccordee === false ? 'non accordée par le téléphone (installe l\'appli sur l\'écran d\'accueil)' : 'non disponible';
+  const derniere = r.derniereSauvegarde ? dateLongue(r.derniereSauvegarde) : 'jamais';
   html += `<h2>Sauvegarde</h2>
-    <p class="aide">Tes données restent uniquement dans ce téléphone. Dernière sauvegarde : ${derniere}.</p>
     <div class="deux-colonnes">
-      <button class="btn btn-principal" data-action="exporter">Exporter mes données</button>
-      <button class="btn btn-discret" id="importer">Importer mes données</button>
+      <button class="btn btn-principal" data-action="exporter">Exporter</button>
+      <button class="btn btn-discret" id="importer">Importer</button>
     </div>
-    <p class="aide" style="margin-top:12px">Protection contre l'effacement : ${protection}.<br><span id="espace-utilise"></span></p>`;
+    <p class="aide" style="margin-top:12px">Dernière sauvegarde : ${derniere}.${persistanceAccordee === false ? ' Installe l\'appli sur l\'écran d\'accueil pour protéger tes données.' : ''}</p>`;
 
-  // Conservation
-  html += `<h2>Conservation du détail</h2>
+  // Conservation et effacement
+  html += `<h2>Historique</h2>
     <div class="champ"><select id="conservation" aria-label="Durée de conservation">
       ${[3, 6, 12, 24].map((n) => `<option value="${n}" ${r.conservationMois === n ? 'selected' : ''}>Garder le détail ${n} mois</option>`).join('')}
     </select></div>
-    <p class="aide">Après cette durée, chaque mois est résumé en une ligne (total dépensé, économies). L'appli reste légère.</p>`;
-
-  // Zone sensible
-  html += `<h2>Effacer</h2>
-    <button class="btn btn-danger btn-large" id="tout-effacer">Effacer toutes les données</button>
-    <p class="aide">Pense à exporter avant. Cette action est définitive.</p>`;
+    <button class="btn btn-danger btn-large" id="tout-effacer">Effacer toutes les données</button>`;
 
   vue.innerHTML = html;
 
+  // Budget total : enregistré quand on quitte le champ
+  const champBudget = $('#budget-total', vue);
+  champBudget.addEventListener('input', () => { $('#repartition').innerHTML = texteRepartition(lireMontant(champBudget.value)); });
+  champBudget.addEventListener('change', () => {
+    const v = lireMontant(champBudget.value);
+    if (!(v >= 0)) { toast('Montant invalide. Exemple : 1500'); champBudget.value = montantEnTexte(r.budgetTotal); return; }
+    r.budgetTotal = v;
+    sauver('reglages', r);
+    const fiche = assurerMois(cleMois());
+    fiche.budgetTotal = v;
+    sauver('mois', fiche);
+    rendreTout();
+    toast('Budget enregistré.');
+  });
+
+  // Bouton « Mettre le budget à … » (le message est réécrit au fil des modifications)
+  vue.onclick = (ev) => {
+    if (!ev.target.closest('#ajuster-budget')) return;
+    const somme = sommeEnveloppes(r.enveloppes);
+    r.budgetTotal = somme;
+    sauver('reglages', r);
+    const fiche = assurerMois(cleMois());
+    fiche.budgetTotal = somme;
+    sauver('mois', fiche);
+    rendreTout();
+    toast(`Budget du mois : ${euros(somme)}.`);
+  };
   $$('[data-editer]', vue).forEach((b) => b.addEventListener('click', () => editerEnveloppe(b.dataset.editer)));
-  $$('[data-monter]', vue).forEach((b) => b.addEventListener('click', () => deplacerEnveloppe(Number(b.dataset.monter), -1)));
-  $$('[data-descendre]', vue).forEach((b) => b.addEventListener('click', () => deplacerEnveloppe(Number(b.dataset.descendre), 1)));
+  $$('[data-montant-env]', vue).forEach((champ) => {
+    champ.addEventListener('focus', () => champ.select());
+    champ.addEventListener('change', () => {
+      const liste = copie(r.enveloppes);
+      const e = liste.find((x) => x.id === champ.dataset.montantEnv);
+      if (!e) return;
+      const v = champ.value.trim() === '' ? 0 : lireMontant(champ.value);
+      const ancien = e.type === 'repas' ? e.prixRepas : (e.montant || 0);
+      if (!(v >= 0) || (e.type === 'repas' && !(v > 0))) {
+        toast(e.type === 'repas' ? 'Prix invalide. Exemple : 6,59' : 'Montant invalide. Exemple : 450');
+        champ.value = montantEnTexte(ancien);
+        return;
+      }
+      if (e.type === 'repas') e.prixRepas = v; else e.montant = v;
+      appliquerEnveloppes(liste);
+      champ.value = montantEnTexte(v);
+      $('#sous-' + e.id).textContent = sousTexteEnveloppe(e);
+      $('#repartition').innerHTML = texteRepartition(r.budgetTotal);
+      rendreGlobal();
+      toast(`${e.nom} : ${e.type === 'repas' ? euros(v) + ' par repas' : euros(v)}.`);
+    });
+  });
   $('#ajouter-env', vue).addEventListener('click', () => editerEnveloppe(null));
   $('#importer', vue).addEventListener('click', () => $('#fichier-import').click());
   $('#conservation', vue).addEventListener('change', (ev) => {
     r.conservationMois = Number(ev.target.value);
     sauver('reglages', r);
-    toast('Durée de conservation enregistrée.');
+    toast('Enregistré.');
   });
   $('#tout-effacer', vue).addEventListener('click', toutEffacer);
+  brancherActionsCommunes(vue);
 
   // Devises favorites, frais, taux
   $$('[data-retirer-favori]', vue).forEach((b) => b.addEventListener('click', () => {
@@ -1331,7 +1463,7 @@ function rendreReglages() {
       rechercheFavori = false;
       sauver('reglages', r);
       rendreReglages();
-      toast(`${nomDevise(code)} ajouté aux boutons rapides.`);
+      toast(`${nomDevise(code)} ajouté.`);
     };
     champFavori.addEventListener('input', () => afficherResultatsDevises(zone, champFavori.value, choisir));
     afficherResultatsDevises(zone, '', choisir);
@@ -1345,26 +1477,9 @@ function rendreReglages() {
     }
     dev.fraisPct = Math.round(v * 100) / 100;
     sauver('reglages', r);
-    toast('Frais de change enregistrés.');
+    toast('Enregistré.');
   });
   $('#maj-taux', vue).addEventListener('click', () => majTaux(true));
-  brancherActionsCommunes(vue);
-
-  if (navigator.storage && navigator.storage.estimate) {
-    navigator.storage.estimate().then((e) => {
-      const z = $('#espace-utilise');
-      if (z && e.usage != null) z.textContent = `Espace utilisé par l'appli : environ ${Math.max(1, Math.round(e.usage / 1024))} Ko.`;
-    }).catch(() => {});
-  }
-}
-
-function deplacerEnveloppe(i, sens) {
-  const liste = copie(etat.reglages.enveloppes);
-  const j = i + sens;
-  if (j < 0 || j >= liste.length) return;
-  [liste[i], liste[j]] = [liste[j], liste[i]];
-  appliquerEnveloppes(liste);
-  rendreTout();
 }
 
 function editerEnveloppe(id) {
@@ -1396,7 +1511,7 @@ function editerEnveloppe(id) {
       <div class="champ"><label for="env-montant">Montant par mois (€)</label>
         <input id="env-montant" class="montant-saisie" inputmode="decimal" autocomplete="off" placeholder="0,00" value="${esc(montantTxt)}"></div>`;
     const cagnotte = e.type === 'variable' ? `
-      <label class="interrupteur champ"><span>Peut puiser dans la cagnotte des repas si elle est vide</span>
+      <label class="interrupteur champ"><span>Si elle est vide, peut utiliser les économies des repas</span>
         <input type="checkbox" id="env-cagnotte" ${e.cagnotte ? 'checked' : ''}></label>` : '';
 
     const p = ouvrirPanneau(`
@@ -1566,6 +1681,11 @@ function migrer(donnees) {
     completerReglages(donnees.reglages);
     donnees.versionSchema = 2;
   }
+  // Version 2 → 3 : budget total (égal à la somme des enveloppes au départ)
+  if (donnees.versionSchema === 2) {
+    completerReglages(donnees.reglages);
+    donnees.versionSchema = 3;
+  }
   return donnees;
 }
 
@@ -1640,7 +1760,8 @@ async function archiver() {
       reste: c.resteGlobal,
       economies: c.repas ? c.repas.cagnotte : 0,
       repasPris: c.repas ? c.repas.repasPris : 0,
-      parEnveloppe: etat.mois[cle].enveloppes.map((e) => ({ nom: e.nom, couleur: e.couleur, depense: c.parEnv[e.id].consomme }))
+      revenus: c.revenus,
+      parEnveloppe: [...etat.mois[cle].enveloppes, ENV_RESERVE].map((e) => ({ nom: e.nom, couleur: e.couleur, depense: c.parEnv[e.id].consomme }))
     };
   });
   const aEffacer = etat.depenses.filter((d) => liste.includes(d.mois));
@@ -1701,6 +1822,7 @@ function brancherInterface() {
   });
   // Quand on revient dans l'appli : nouveau jour ou nouveau mois → on met à jour
   window.addEventListener('online', () => majTaux());
+  window.addEventListener('scroll', majBarreHaut, { passive: true });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
     majTaux();
