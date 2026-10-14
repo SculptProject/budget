@@ -6,7 +6,7 @@
    change le numéro ci-dessous (v1 → v2 → v3...).
    C'est ce qui dit au téléphone « il y a du nouveau ».
    ========================================================= */
-const VERSION_CACHE = 'budget-v6';
+const VERSION_CACHE = 'budget-v9';
 
 // Liste des fichiers à garder hors connexion (chemins relatifs)
 const FICHIERS = [
@@ -15,9 +15,9 @@ const FICHIERS = [
   './style.css',
   './app.js',
   './manifest.json',
-  './icons/icon-192.png',
-  './icons/icon-512.png',
-  './icons/apple-touch-icon.png',
+  './icons/logo-camembert-192.png',
+  './icons/logo-camembert-512.png',
+  './icons/logo-camembert-180.png',
   './fonts/manrope.woff2'
 ];
 

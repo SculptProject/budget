@@ -397,6 +397,7 @@ const sommeEnveloppes = (liste) => liste.reduce((s, e) => s + montantEnveloppe(e
 // La réserve libre : la part du budget qui n'est dans aucune enveloppe, plus les revenus
 const ID_RESERVE = 'reserve';
 const ENV_RESERVE = { id: ID_RESERVE, nom: 'Réserve', type: 'reserve', couleur: '#A88A45' };
+const COULEUR_IMPREVU = '#C2412D';
 
 /*
   Règles :
@@ -414,13 +415,14 @@ function calculerMois(cle, depenses = depensesDuMois(cle)) {
 
   const parEnv = {};
   fiche.enveloppes.forEach((e) => { parEnv[e.id] = { env: e, budget: montantEnveloppe(e), depense: 0 }; });
-  const reserve = { env: ENV_RESERVE, budget: 0, depense: 0 };
+  const reserve = { env: ENV_RESERVE, budget: 0, depense: 0, imprevus: 0 }; // imprévus : payés par la réserve
   parEnv[ID_RESERVE] = reserve;
 
   let revenus = 0;
   let horsEnveloppe = 0; // dépenses d'une enveloppe supprimée depuis
   depenses.forEach((d) => {
     if (d.revenu) { revenus += d.montant; return; }
+    if (d.imprevu) reserve.imprevus += d.montant;
     if (parEnv[d.envId]) parEnv[d.envId].depense += d.montant;
     else horsEnveloppe += d.montant;
   });
@@ -648,6 +650,74 @@ function rangeeEnveloppe(p) {
     </button>`;
 }
 
+/*
+  Écart à combler : quand les enveloppes dépassent le budget (+ revenus),
+  il faut ne pas dépenser cet écart d'ici la fin du mois.
+  - déjà comblé : économies de repas réelles à cet instant
+  - projection : chaque enveloppe prolongée jusqu'à la fin du mois. Le rythme
+    s'appuie d'abord sur le montant prévu, puis de plus en plus sur le rythme
+    réel à mesure que le mois avance (évite les projections absurdes le 2 du mois).
+*/
+function projectionEcart(c, fiche, cle) {
+  // écart = ce que la réserve ne peut pas payer (enveloppes au-delà du budget, imprévus...)
+  const ecart = Math.max(0, -c.reserve.reste);
+  if (!ecart) return null;
+  const nbJours = joursDuMois(cle);
+  const jour = cle === cleMois() ? new Date().getDate() : nbJours;
+  const w = Math.min(1, jour / nbJours);     // part du mois écoulée
+  const futur = (depense, budget) => (1 - w) * (depense + (1 - w) * Math.max(0, budget)); // rythme mensuel estimé × temps restant
+
+  let aVenir = 0;
+  let finRepas = null;
+  fiche.enveloppes.forEach((e) => {
+    const p = c.parEnv[e.id];
+    if (e.type === 'fixe') {
+      if (!p.paye) aVenir += p.budget;
+    } else if (e.type === 'variable') {
+      aVenir += futur(p.depense, p.budget);
+    } else if (e.type === 'repas') {
+      const coutMoyen = p.repasPris > 0 ? p.depense / p.repasPris : e.prixRepas;
+      const coutPrevu = w * coutMoyen + (1 - w) * e.prixRepas;
+      const suite = Math.max(0, p.repasRestants) * coutPrevu;
+      aVenir += suite;
+      finRepas = p.budget - (p.depense + suite);   // économies de repas estimées en fin de mois
+    }
+  });
+  // les imprévus sont ponctuels : on ne les prolonge pas, seules les dépenses courantes de la réserve le sont
+  aVenir += futur(c.reserve.depense - c.reserve.imprevus, c.reserve.budget - c.reserve.imprevus);
+
+  const soldeFin = Math.round(c.resteGlobal - aVenir); // solde estimé au dernier jour
+  const repas = Math.round(finRepas || 0);
+  return {
+    ecart,
+    imprevus: c.reserve.imprevus,
+    dejaComble: Math.max(0, c.repas ? c.repas.cagnotte : 0),
+    soldeFin,
+    repas,
+    autres: soldeFin + ecart - repas  // ce que les autres enveloppes laisseraient
+  };
+}
+
+function blocEcart(pr) {
+  const sur = Math.min(1, pr.dejaComble / pr.ecart);
+  const proj = Math.min(1, Math.max(0, (pr.ecart + pr.soldeFin) / pr.ecart));
+  const resultat = pr.soldeFin >= 0
+    ? `Au rythme actuel, <strong>l'écart sera comblé</strong>${pr.soldeFin >= 100 ? `, avec environ ${euros(pr.soldeFin)} d'avance` : ''}.`
+    : `Au rythme actuel, <span class="alerte-heros">il manquera environ ${euros(-pr.soldeFin)}</span> en fin de mois.`;
+  return `
+    <div class="ecart">
+      <div class="ecart-haut"><span>Écart à combler</span><strong>${euros(pr.ecart)}</strong></div>
+      ${pr.imprevus > 0 ? `<p class="ecart-detail">Imprévus ce mois-ci : ${euros(pr.imprevus)}, payés d'abord par ta réserve.</p>` : ''}
+      <div class="jauge-ecart" role="img" aria-label="${euros(pr.dejaComble)} déjà comblés sur ${euros(pr.ecart)}">
+        <div class="ecart-proj" style="width:${(proj * 100).toFixed(1)}%"></div>
+        <div class="ecart-sur" style="width:${(sur * 100).toFixed(1)}%"></div>
+      </div>
+      <p>${pr.dejaComble > 0 ? `<strong>${euros(Math.min(pr.dejaComble, pr.ecart))}</strong> déjà comblés par tes économies de repas.` : 'Rien de comblé pour l\'instant : tes économies de repas sont à zéro.'}</p>
+      <p>${resultat}</p>
+      <p class="ecart-detail">Estimation fin de mois : repas ${eurosSigne(pr.repas)}, autres enveloppes ${eurosSigne(pr.autres)}.</p>
+    </div>`;
+}
+
 // Carte héros : reste du mois, jauge des dépenses courantes et repère du jour
 function carteHeros(c, fiche, cle) {
   const fixes = fiche.enveloppes.filter((e) => e.type === 'fixe');
@@ -690,6 +760,7 @@ function carteHeros(c, fiche, cle) {
         </div>
       </div>
       <div class="heros-legende"><span>${euros(depenseCourante)} dépensés</span><span>sur ${euros(budgetCourant)}</span></div>
+      ${(() => { const pr = projectionEcart(c, fiche, cle); return pr ? blocEcart(pr) : ''; })()}
       <p class="heros-conseil">${conseil}</p>
     </section>`;
 }
@@ -706,7 +777,7 @@ function rendreBudget() {
 
   html += '<h2>Enveloppes</h2><div class="liste">';
   fiche.enveloppes.filter((e) => e.type !== 'fixe').forEach((e) => { html += rangeeEnveloppe(c.parEnv[e.id]); });
-  if (c.reserve.budget !== 0 || c.reserve.depense > 0) html += rangeeEnveloppe(c.reserve);
+  if (c.reserve.reste >= 0 && (c.reserve.budget > 0 || c.reserve.depense > 0)) html += rangeeEnveloppe(c.reserve);
   html += '</div>';
 
   const fixes = fiche.enveloppes.filter((e) => e.type === 'fixe');
@@ -766,8 +837,8 @@ function ouvrirSaisie(options = {}) {
 
   // Valeurs du formulaire
   const f = existante ? {
-    sens: existante.revenu ? 'revenu' : 'depense',
-    envId: existante.revenu ? ID_RESERVE : existante.envId,
+    sens: existante.revenu ? 'revenu' : existante.imprevu ? 'imprevu' : 'depense',
+    envId: existante.revenu || existante.imprevu ? ID_RESERVE : existante.envId,
     genre: existante.genre,
     moment: existante.moment || momentParDefaut(),
     devise: existante.devise || 'EUR',
@@ -780,7 +851,7 @@ function ouvrirSaisie(options = {}) {
     options: false,
     recherche: false
   } : {
-    sens: options.revenu ? 'revenu' : 'depense',
+    sens: options.revenu ? 'revenu' : options.imprevu ? 'imprevu' : 'depense',
     envId: options.envId || (eRepas ? eRepas.id : envsSaisie[0].id),
     genre: options.genre || 'repas',
     moment: momentParDefaut(),
@@ -795,6 +866,8 @@ function ouvrirSaisie(options = {}) {
     recherche: false
   };
   const estRevenu = () => f.sens === 'revenu';
+  const estImprevu = () => f.sens === 'imprevu';
+  const horsEnveloppe = () => estRevenu() || estImprevu(); // payé par / ajouté à la réserve
   const estRepasEnv = () => !estRevenu() && eRepas && f.envId === eRepas.id;
   const avecMontant = () => !(estRepasEnv() && sansMontant(f.genre));
   const avecMoment = () => estRepasEnv() && f.genre !== 'courses';
@@ -832,11 +905,12 @@ function ouvrirSaisie(options = {}) {
 
   function dessiner() {
     const titre = existante
-      ? (estRevenu() ? 'Modifier le revenu' : 'Modifier la dépense')
-      : (estRevenu() ? 'Nouveau revenu' : 'Nouvelle dépense');
+      ? (estRevenu() ? 'Modifier le revenu' : estImprevu() ? 'Modifier l\'imprévu' : 'Modifier la dépense')
+      : (estRevenu() ? 'Nouveau revenu' : estImprevu() ? 'Nouvel imprévu' : 'Nouvelle dépense');
     const sens = existante ? '' : `
       <div class="champ"><div class="segment">
-        <button data-sens="depense" aria-pressed="${!estRevenu()}">Dépense</button>
+        <button data-sens="depense" aria-pressed="${f.sens === 'depense'}">Dépense</button>
+        <button data-sens="imprevu" aria-pressed="${estImprevu()}">Imprévu</button>
         <button data-sens="revenu" aria-pressed="${estRevenu()}">Revenu</button>
       </div></div>`;
 
@@ -865,7 +939,7 @@ function ouvrirSaisie(options = {}) {
       montant = `<p class="aide">Compte pour ${euros(eRepas.prixRepas)} dans tes économies, sans dépense.</p>`;
     }
 
-    const envChoix = estRevenu() ? '' : `
+    const envChoix = horsEnveloppe() ? '' : `
       <div class="champ"><div class="choix">
         ${envsSaisie.map((e) => `<button style="--c:${e.couleur}" data-choix-env="${e.id}" aria-pressed="${e.id === f.envId}"><span class="pastille"></span>${esc(e.nom)}</button>`).join('')}
       </div></div>`;
@@ -880,8 +954,8 @@ function ouvrirSaisie(options = {}) {
         <button data-moment="midi" aria-pressed="${f.moment === 'midi'}">Midi</button>
         <button data-moment="soir" aria-pressed="${f.moment === 'soir'}">Soir</button>
       </div></div>` : ''}
-      <div class="champ"><label for="saisie-note">Note</label>
-        <input id="saisie-note" type="text" autocomplete="off" placeholder="${estRevenu() ? 'Ex. : babysitting' : 'Ex. : resto U, cinéma'}" value="${esc(f.note)}"></div>
+      ${estImprevu() ? '' : `<div class="champ"><label for="saisie-note">Note</label>
+        <input id="saisie-note" type="text" autocomplete="off" placeholder="${estRevenu() ? 'Ex. : babysitting' : 'Ex. : resto U, cinéma'}" value="${esc(f.note)}"></div>`}
       <div class="champ"><label for="saisie-date">Date</label>
         <input id="saisie-date" type="date" min="${mois}-01" max="${derniersJour}" value="${f.date}"></div>` : '';
 
@@ -891,9 +965,11 @@ function ouvrirSaisie(options = {}) {
       ${montant}
       ${envChoix}
       ${genreChoix}
+      ${estImprevu() ? `<div class="champ"><input id="saisie-note" type="text" autocomplete="off" aria-label="Description de l'imprévu"
+        placeholder="Quoi ? Ex. : réparation, médecin" value="${esc(f.note)}"></div>` : ''}
       <div class="apercu" id="apercu"></div>
       <button class="btn btn-principal btn-large" id="saisie-ok">${existante ? 'Enregistrer' : 'Ajouter'}</button>
-      <button class="plus-options" id="plus-options" aria-expanded="${f.options}">${f.options ? 'Masquer les options' : (avecMoment() ? 'Midi ou soir, note, date' : 'Note, date')}</button>
+      <button class="plus-options" id="plus-options" aria-expanded="${f.options}">${f.options ? 'Masquer les options' : (avecMoment() ? 'Midi ou soir, note, date' : estImprevu() ? 'Changer la date' : 'Note, date')}</button>
       ${optionsContenu}
       ${existante ? '<button class="btn btn-danger btn-large" id="saisie-suppr">Supprimer</button>' : ''}
     `);
@@ -901,7 +977,7 @@ function ouvrirSaisie(options = {}) {
     $$('[data-sens]', p).forEach((b) => b.addEventListener('click', () => {
       if (f.sens === b.dataset.sens) return;
       f.sens = b.dataset.sens;
-      if (estRevenu()) {
+      if (horsEnveloppe()) {
         f.envId = ID_RESERVE;
         if (f.auto) { f.montantTxt = ''; f.auto = false; }
       } else {
@@ -986,8 +1062,8 @@ function ouvrirSaisie(options = {}) {
     const date = f.date && f.date.startsWith(mois) ? f.date : (mois === cleMois() ? aujourdhui() : `${mois}-01`);
     const enreg = {
       id: existante ? existante.id : nouvelId(),
-      envId: estRevenu() ? ID_RESERVE : f.envId,
-      genre: estRevenu() ? 'revenu' : (estRepasEnv() ? f.genre : 'libre'),
+      envId: horsEnveloppe() ? ID_RESERVE : f.envId,
+      genre: estRevenu() ? 'revenu' : estImprevu() ? 'imprevu' : (estRepasEnv() ? f.genre : 'libre'),
       moment: avecMoment() ? f.moment : null,
       montant,          // en centimes d'euro : c'est ce montant qui compte dans le budget
       devise,           // devise de saisie (EUR, MUR...)
@@ -999,7 +1075,8 @@ function ouvrirSaisie(options = {}) {
       mois,
       creeLe: existante ? existante.creeLe : new Date().toISOString()
     };
-    if (estRevenu()) enreg.revenu = true; // un revenu augmente le budget (va dans la réserve)
+    if (estRevenu()) enreg.revenu = true;   // un revenu augmente le budget (va dans la réserve)
+    if (estImprevu()) enreg.imprevu = true; // un imprévu est payé par la réserve, puis devient un écart à combler
     return enreg;
   }
 
@@ -1011,6 +1088,18 @@ function ouvrirSaisie(options = {}) {
 
     if (estRevenu()) {
       return { niveau: 'ok', texte: `Ta réserve passera à <strong>${euros(apres.reserve.reste)}</strong>, ton budget du mois à <strong>${euros(apres.totalBudget)}</strong>.` };
+    }
+    if (estImprevu()) {
+      // la réserve paie ce qu'elle peut, le reste devient un écart à combler
+      const dispo = Math.max(0, avant.reserve.reste);
+      const parReserve = Math.min(dispo, dep ? dep.montant : 0);
+      const enEcart = (dep ? dep.montant : 0) - parReserve;
+      if (!enEcart) return { niveau: 'ok', texte: `Payé par ta réserve. Il y restera <strong>${euros(apres.reserve.reste)}</strong>.` };
+      const ecartTotal = Math.max(0, -apres.reserve.reste);
+      return {
+        niveau: 'ok', classe: 'attention',
+        texte: `${parReserve > 0 ? `Ta réserve en paie <strong>${euros(parReserve)}</strong>. ` : 'Ta réserve est vide. '}<strong>${euros(enEcart)}</strong> deviennent un écart à combler par tes économies${ecartTotal > enEcart ? ` (écart total : <strong>${euros(ecartTotal)}</strong>)` : ''}.`
+      };
     }
 
     const pA = apres.parEnv[f.envId];
@@ -1077,8 +1166,9 @@ function ouvrirSaisie(options = {}) {
       else zone.innerHTML = f.montantTxt ? 'Montant invalide. Exemple : 6,59' : 'Indique le montant.';
       return;
     }
-    const { texte, niveau } = analyser(dep);
-    zone.className = 'apercu' + (niveau === 'alerte' ? ' alerte' : niveau === 'attention' ? ' attention' : '');
+    const { texte, niveau, classe } = analyser(dep);
+    const style = classe || niveau;
+    zone.className = 'apercu' + (style === 'alerte' ? ' alerte' : style === 'attention' ? ' attention' : '');
     zone.innerHTML = texte;
   }
 
@@ -1111,11 +1201,13 @@ function ouvrirSaisie(options = {}) {
     }
     fermerPanneau();
     rendreTout();
-    toast(estRevenu() ? (existante ? 'Revenu modifié.' : 'Revenu ajouté.') : (existante ? 'Dépense modifiée.' : 'Dépense ajoutée.'));
+    toast(estRevenu() ? (existante ? 'Revenu modifié.' : 'Revenu ajouté.')
+      : estImprevu() ? (existante ? 'Imprévu modifié.' : 'Imprévu ajouté.')
+      : (existante ? 'Dépense modifiée.' : 'Dépense ajoutée.'));
   }
 
   async function supprimerDepense() {
-    const quoi = estRevenu() ? 'ce revenu' : 'cette dépense';
+    const quoi = estRevenu() ? 'ce revenu' : estImprevu() ? 'cet imprévu' : 'cette dépense';
     const ok = await confirmer({ titre: `Supprimer ${quoi} ?`, texte: 'Cette action est définitive.', oui: 'Supprimer', danger: true });
     if (!ok) return;
     etat.depenses = etat.depenses.filter((d) => d.id !== existante.id);
@@ -1136,6 +1228,7 @@ let moisHistorique = null;
 
 function titreDepense(d, env) {
   if (d.revenu) return d.note || 'Revenu';
+  if (d.imprevu) return d.note || 'Imprévu';
   if (env && env.type === 'repas') {
     const genre = GENRES_REPAS[d.genre] || 'Dépense';
     if (d.genre === 'courses') return d.note ? `Courses, ${d.note}` : 'Courses';
@@ -1167,6 +1260,13 @@ function rendreHistorique() {
     <div class="tuile"><div class="tuile-etiquette">Reste</div><div class="tuile-valeur ${c.resteGlobal < 0 ? 'negatif' : ''}">${euros(c.resteGlobal)}</div></div>
   </div>`;
   if (c.revenus > 0) html += `<p class="aide">Dont ${euros(c.revenus)} de revenus ajoutés ce mois-ci.</p>`;
+  if (c.reserve.imprevus > 0) html += `<p class="aide">Dont ${euros(c.reserve.imprevus)} d'imprévus.</p>`;
+  if (cle !== cleMois() && c.reserve.reste < 0) {
+    const ecart = -c.reserve.reste;
+    html += c.resteGlobal >= 0
+      ? `<p class="aide"><span class="positif">Écart de ${euros(ecart)} comblé</span> par tes économies.</p>`
+      : `<p class="aide"><span class="rouge">Écart de ${euros(ecart)} : il a manqué ${euros(-c.resteGlobal)}.</span></p>`;
+  }
 
   if (!deps.length) {
     html += `<div class="vide">Rien ce mois-ci. Appuie sur + pour commencer.</div>`;
@@ -1183,11 +1283,11 @@ function rendreHistorique() {
       const origine = d.devise && d.devise !== 'EUR' ? `<span class="ligne-orig">${esc(formatDevise(d.montantOrigine, d.devise))}</span>` : '';
       const valeur = d.revenu ? `+${euros(d.montant)}` : (gratuit ? '0 €' : euros(d.montant));
       html += `<button class="ligne" data-dep="${d.id}">
-        <span class="pastille" style="--c:${d.revenu ? 'var(--vert)' : (env ? env.couleur : '#999')}"></span>
+        <span class="pastille" style="--c:${d.revenu ? 'var(--vert)' : d.imprevu ? COULEUR_IMPREVU : (env ? env.couleur : '#999')}"></span>
         <span class="ligne-texte"><span class="ligne-titre">${esc(titreDepense(d, env))}</span>
         ${(() => {
           const titre = titreDepense(d, env);
-          const sous = d.revenu ? 'Ajouté à la réserve' : (env ? (env.nom === titre ? '' : env.nom) : 'Enveloppe supprimée');
+          const sous = d.revenu ? 'Ajouté à la réserve' : d.imprevu ? (d.note ? 'Imprévu' : '') : (env ? (env.nom === titre ? '' : env.nom) : 'Enveloppe supprimée');
           return sous ? `<span class="ligne-sous">${esc(sous)}</span>` : '';
         })()}</span>
         <span class="ligne-valeur ${gratuit || d.revenu ? 'zero' : ''}"><span>${valeur}</span>${origine}</span>
@@ -1267,7 +1367,8 @@ function rendreStats() {
 
   // 1. Où part l'argent
   const parts = [...fiche.enveloppes, ENV_RESERVE]
-    .map((e) => ({ nom: e.nom, couleur: e.couleur, valeur: c.parEnv[e.id].consomme }))
+    .map((e) => ({ nom: e.nom, couleur: e.couleur, valeur: c.parEnv[e.id].consomme - (e.id === ID_RESERVE ? c.reserve.imprevus : 0) }))
+    .concat([{ nom: 'Imprévus', couleur: COULEUR_IMPREVU, valeur: c.reserve.imprevus }])
     .filter((p) => p.valeur > 0)
     .sort((a, b) => b.valeur - a.valeur);
   html += `<h2>Où part ton argent</h2><div class="graphique">${graphiqueAnneau(parts)}</div>`;
@@ -1305,7 +1406,7 @@ function texteRepartition(budget) {
   const somme = sommeEnveloppes(etat.reglages.enveloppes);
   if (!(budget >= 0)) return '<span class="rouge">Montant invalide.</span>';
   const reserve = budget - somme;
-  if (reserve < 0) return `<span class="rouge">Tes enveloppes (${euros(somme)}) dépassent ce budget de ${euros(-reserve)}.</span> <button class="lien" id="ajuster-budget">Mettre le budget à ${euros(somme)}</button>`;
+  if (reserve < 0) return `<span class="attention">Tes enveloppes (${euros(somme)}) dépassent ce budget de ${euros(-reserve)}.</span> Cet écart devra être comblé par tes économies : tu le suis sur la carte principale. <button class="lien" id="ajuster-budget">Ou mettre le budget à ${euros(somme)}</button>`;
   return `Enveloppes : ${euros(somme)}. Réserve libre : ${euros(reserve)}.`;
 }
 
@@ -1761,6 +1862,8 @@ async function archiver() {
       economies: c.repas ? c.repas.cagnotte : 0,
       repasPris: c.repas ? c.repas.repasPris : 0,
       revenus: c.revenus,
+      ecart: Math.max(0, -c.reserve.reste),
+      imprevus: c.reserve.imprevus,
       parEnveloppe: [...etat.mois[cle].enveloppes, ENV_RESERVE].map((e) => ({ nom: e.nom, couleur: e.couleur, depense: c.parEnv[e.id].consomme }))
     };
   });
